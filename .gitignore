@@ -1,0 +1,35 @@
+# James' SkycaseFS Optimized Ignore
+
+# 1. Τα τεράστια Datasets (Αυτό σου έκανε τη ζημιά)
+assets/data/
+*.json
+*.csv
+
+# 2. Φάκελοι συστήματος και Build (δεν χρειάζονται στη Google)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+build/
+bin/
+obj/
+/windows/
+/android/
+/ios/
+/linux/
+/macos/
+
+# 3. IDE και προσωρινά αρχεία
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+*.log
+
+# 4. Flutter/Dart specific
+**/doc/api/
+app.*.symbols
+app.*.map.json
