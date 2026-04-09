@@ -5,7 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 class MetarService {
   // Cache lifespan (10 minutes)
   static const int cacheSeconds = 600;
-
+  static final Map<String, Map<String, dynamic>> _briefingMemoryCache = {};
+  static final Map<String, int> _briefingMemoryTime = {};
   // NOAA modern endpoint
   static const String _noaaUrl =
       "https://aviationweather.gov/api/data/metar?format=json&ids=";
@@ -164,7 +165,7 @@ class MetarService {
     // CEILING
     int? ceiling;
 
-    int? _extractBase(String token) {
+    int? extractBase(String token) {
       if (token.length < 6) return null;
       final digits = token.substring(3, 6);
       if (digits.contains("/")) return null;
@@ -173,7 +174,7 @@ class MetarService {
 
     for (final c in clouds) {
       if (c.startsWith("BKN") || c.startsWith("OVC")) {
-        final base = _extractBase(c);
+        final base = extractBase(c);
         if (base != null) {
           final alt = base * 100;
           if (ceiling == null || alt < ceiling) ceiling = alt;
@@ -243,24 +244,39 @@ class MetarService {
   // BRIEFING
   // =======================================================
   static Future<Map<String, dynamic>?> getBriefing(String icao) async {
+    icao = icao.toUpperCase().trim();
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+    // 1) FAST MEMORY CACHE
+    final mem = _briefingMemoryCache[icao];
+    final memTime = _briefingMemoryTime[icao];
+    if (mem != null && memTime != null) {
+      final ageSeconds = (nowMs - memTime) ~/ 1000;
+      if (ageSeconds < cacheSeconds) {
+        return mem;
+      }
+    }
+
+    // 2) EXISTING RAW CACHE / NETWORK FLOW
     final raw = await fetchRawMetar(icao);
+
     if (!_isValidRaw(raw)) {
       return {
-        "icao": icao.toUpperCase(),
+        "icao": icao,
         "raw": "N/A",
         "wind": "",
         "temp": "N/A",
         "clouds": const <String>[],
         "visibility": "N/A",
         "category": "UNKNOWN",
-        "summary": "${icao.toUpperCase()} • Weather N/A",
+        "summary": "$icao • Weather N/A",
       };
     }
 
     final d = decodeMetar(raw!);
 
-    return {
-      "icao": icao.toUpperCase(),
+    final briefing = {
+      "icao": icao,
       "raw": d["raw"],
       "wind": d["wind"],
       "temp": d["temp"],
@@ -268,9 +284,14 @@ class MetarService {
       "visibility": d["visibility"],
       "category": d["category"],
       "summary":
-          "${icao.toUpperCase()} • ${d["temp"]}°C • ${d["wind"]} • ${d["clouds"].isNotEmpty ? d["clouds"][0] : ""}"
+          "$icao • ${d["temp"]}°C • ${d["wind"]} • ${d["clouds"].isNotEmpty ? d["clouds"][0] : ""}"
               .trim(),
     };
+
+    _briefingMemoryCache[icao] = briefing;
+    _briefingMemoryTime[icao] = nowMs;
+
+    return briefing;
   }
 
   // =======================================================

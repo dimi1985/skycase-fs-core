@@ -15,20 +15,29 @@ class Waypoint {
     required this.type,
   });
 
+  static double _readDouble(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is num) return value.toDouble();
+    return double.tryParse(value.toString()) ?? 0.0;
+  }
+
   factory Waypoint.fromJson(Map<String, dynamic> j) {
     return Waypoint(
       id: j['waypoint_id'] is int ? j['waypoint_id'] : null,
-      ident: j['ident'] ?? '',
-      name: j['name'],
-      lat: (j['laty'] as num?)?.toDouble() ?? 0,
-      lon: (j['lonx'] as num?)?.toDouble() ?? 0,
-      type: j['type'] ?? '',
+      ident: (j['ident'] ?? j['icao'] ?? '').toString(),
+      name: j['name']?.toString(),
+
+      // ✅ support BOTH legacy and backend keys
+      lat: _readDouble(j['lat'] ?? j['laty'] ?? j['latitude']),
+      lon: _readDouble(j['lon'] ?? j['lonx'] ?? j['lng'] ?? j['longitude']),
+
+      type: (j['type'] ?? '').toString(),
     );
   }
 
   Map<String, dynamic> toJson() {
     return {
-      "waypoint_id": id, // may be null (OK)
+      "waypoint_id": id,
       "ident": ident,
       "name": name,
       "lat": lat,

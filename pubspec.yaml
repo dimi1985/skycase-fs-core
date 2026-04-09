@@ -38,7 +38,7 @@ dependencies:
   provider: ^6.1.5
   shared_preferences: ^2.5.3
   web_socket_channel: ^3.0.3
-  flutter_map: ^8.1.1
+  flutter_map: ^8.2.0
   canvas_map: ^0.0.2
   intl: ^0.20.2
   latlong2: ^0.9.1
@@ -79,14 +79,16 @@ flutter:
 
   # To add assets to your application, add an assets section, like this:
   assets:
+    - assets/map_data/
     - assets/data/airports.json
     - assets/data/airport_frequencies.json
-    - assets/data/airspace_all.json
+    - assets/data/airspace.json
     - assets/data/ndb.json
     - assets/data/parking.json
     - assets/data/runways.json
     - assets/data/vors.json
     - assets/data/waypoints.json
+    - assets/data/airways.json
     - assets/sfx/idle_loop.mp3
     - assets/data/aircraft_templates.json
     - assets/images/home_backgrounds/

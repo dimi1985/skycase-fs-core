@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:jwt_decoder/jwt_decoder.dart';
@@ -9,18 +7,18 @@ import 'package:skycase/models/simlink_data.dart';
 import 'package:skycase/models/user.dart';
 import 'package:skycase/providers/auto_flight_provider.dart';
 import 'package:skycase/providers/auto_simlink_provider.dart';
+import 'package:skycase/providers/deep_zoom_provider.dart';
 import 'package:skycase/providers/efb_ui_mode_provider.dart';
 import 'package:skycase/providers/home_arrival_provider.dart';
 import 'package:skycase/providers/navigraph_provider.dart';
 import 'package:skycase/providers/route_builder_provider.dart';
+import 'package:skycase/providers/simbrief_provider.dart';
 
 import 'package:skycase/providers/state_persistence_provider.dart';
 import 'package:skycase/providers/unit_system_provider.dart';
 import 'package:skycase/providers/theme_provider.dart';
 import 'package:skycase/providers/user_provider.dart';
 import 'package:skycase/screens/home_controller_screen.dart';
-
-import 'package:skycase/screens/home_screen.dart';
 import 'package:skycase/screens/auth_screen.dart';
 import 'package:skycase/services/distance_tracker.dart';
 import 'package:skycase/services/flight_log_service.dart';
@@ -99,24 +97,25 @@ class SkyCaseFS extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MultiProvider(
-      providers: [
-        ChangeNotifierProvider(create: (_) => ThemeProvider()),
-        ChangeNotifierProvider(create: (_) => UserProvider()),
-        ChangeNotifierProvider(create: (_) => UnitSystemProvider()),
-        ChangeNotifierProvider(create: (_) => StatePersistenceProvider()),
-        // NEW
-        ChangeNotifierProvider(create: (_) => AutoFlightProvider()),
-        ChangeNotifierProvider(create: (_) => AutoSimLinkProvider()),
-        ChangeNotifierProvider(create: (_) => NavigraphProvider()),
-        ChangeNotifierProvider(create: (_) => RouteBuilderProvider()),
-        ChangeNotifierProvider(create: (_) => EfbUiModeProvider()),
-        ChangeNotifierProvider(create: (_) => HomeArrivalProvider()),
-        // 🛰️ Live SimLink stream
-        StreamProvider<SimLinkData?>.value(
-          value: SimLinkSocketService().stream,
-          initialData: null,
-        ),
-      ],
+  providers: [
+    ChangeNotifierProvider(create: (_) => ThemeProvider()),
+    ChangeNotifierProvider(create: (_) => UserProvider()),
+    ChangeNotifierProvider(create: (_) => UnitSystemProvider()),
+    ChangeNotifierProvider(create: (_) => StatePersistenceProvider()),
+    ChangeNotifierProvider(create: (_) => AutoFlightProvider()),
+    ChangeNotifierProvider(create: (_) => AutoSimLinkProvider()),
+    ChangeNotifierProvider(create: (_) => NavigraphProvider()),
+    ChangeNotifierProvider(create: (_) => RouteBuilderProvider()),
+    ChangeNotifierProvider(create: (_) => EfbUiModeProvider()),
+    ChangeNotifierProvider(create: (_) => HomeArrivalProvider()),
+    ChangeNotifierProvider(create: (_) => SimBriefProvider()..load()),
+    ChangeNotifierProvider(create: (_) => DeepZoomProvider()),
+
+    StreamProvider<SimLinkData?>.value(
+      value: SimLinkSocketService().stream,
+      initialData: null,
+    ),
+  ],
       child: Builder(
         builder: (context) {
           // 🔑 Set user if available

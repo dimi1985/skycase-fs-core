@@ -1,6 +1,9 @@
 enum GroundPhase {
-  parked,
+  pushback,
   taxi,
-  roll,
+  stopped,
+  takeoff,
   airborne,
+  landed,
+  parked,
 }

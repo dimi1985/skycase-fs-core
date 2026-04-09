@@ -1,20 +1,15 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
-import 'package:skycase/models/simlink_data.dart';
 
 class PayloadOverlay extends StatelessWidget {
-  final List<PayloadStation> stations;
   final VoidCallback onClose;
 
-  const PayloadOverlay({
-    super.key,
-    required this.stations,
-    required this.onClose,
-  });
+  const PayloadOverlay({super.key, required this.onClose});
 
   @override
   Widget build(BuildContext context) {
     final isMobile = MediaQuery.of(context).size.width < 600;
+
 
     return Center(
       child: Container(
@@ -45,26 +40,16 @@ class PayloadOverlay extends StatelessWidget {
                   children: [
                     const Icon(Icons.inventory, color: Colors.white),
                     const SizedBox(width: 8),
-                    const Text("Payload Overview", style: TextStyle(color: Colors.white, fontSize: 18)),
+                    const Text(
+                      "Payload Overview",
+                      style: TextStyle(color: Colors.white, fontSize: 18),
+                    ),
                     const Spacer(),
                     IconButton(
                       icon: const Icon(Icons.close, color: Colors.white),
                       onPressed: onClose,
                     ),
                   ],
-                ),
-                const Divider(color: Colors.white24),
-                Expanded(
-                  child: ListView.builder(
-                    itemCount: stations.length,
-                    itemBuilder: (context, index) {
-                      final station = stations[index];
-                      return ListTile(
-                        title: Text(station.name, style: const TextStyle(color: Colors.white)),
-                        trailing: Text("${station.weight.toStringAsFixed(0)} lbs", style: const TextStyle(color: Colors.white)),
-                      );
-                    },
-                  ),
                 ),
               ],
             ),

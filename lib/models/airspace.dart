@@ -9,7 +9,7 @@ class Airspace {
   final String? restrictiveType;
   final String type;
 
-  Airspace({
+  const Airspace({
     required this.boundaryId,
     required this.geometry,
     required this.maxAlt,
@@ -23,15 +23,15 @@ class Airspace {
 
   factory Airspace.fromJson(Map<String, dynamic> j) {
     return Airspace(
-      boundaryId: j['boundary_id'],
-      geometry: j['geometry'],
-      maxAlt: j['max_altitude'],
-      minAlt: j['min_altitude'],
-      multipleCode: j['multiple_code'],
-      name: j['name'] ?? '',
-      restrictiveDesignation: j['restrictive_designation'],
-      restrictiveType: j['restrictive_type'],
-      type: j['type'] ?? '',
+      boundaryId: (j['boundary_id'] as num?)?.toInt() ?? 0,
+      geometry: (j['geometry'] ?? '') as String,
+      maxAlt: (j['max_altitude'] as num?)?.toInt() ?? 0,
+      minAlt: (j['min_altitude'] as num?)?.toInt() ?? 0,
+      multipleCode: j['multiple_code'] as String?,
+      name: (j['name'] ?? '') as String,
+      restrictiveDesignation: j['restrictive_designation'] as String?,
+      restrictiveType: j['restrictive_type'] as String?,
+      type: (j['type'] ?? '') as String,
     );
   }
 }

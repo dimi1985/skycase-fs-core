@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
-import 'package:skycase/screens/flight_route_map.dart';
-import '../models/flight_log.dart';
+import 'package:intl/intl.dart' hide TextDirection;
+
 import '../models/airport_location.dart';
+import '../models/flight_log.dart';
+import 'landing_replay_screen.dart';
 
 class FlightDetailsScreen extends StatelessWidget {
   final FlightLog log;
+
   const FlightDetailsScreen({super.key, required this.log});
 
   @override
@@ -19,7 +21,7 @@ class FlightDetailsScreen extends StatelessWidget {
         backgroundColor: colors.surface,
         foregroundColor: colors.onSurface,
         elevation: 0,
-        title: const Text("Flight Recap"),
+        title: const Text('Flight Recap'),
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(18),
@@ -27,125 +29,173 @@ class FlightDetailsScreen extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _routeHeader(context),
-
             const SizedBox(height: 18),
 
             _sectionCard(
               context,
-              title: "Aircraft",
+              title: 'Aircraft',
               child: _rowText(log.aircraft),
             ),
 
             _sectionCard(
               context,
-              title: "Flight Time",
+              title: 'Flight Time',
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _rowText(
-                    "${dateFormat.format(log.startTime)} → ${dateFormat.format(log.endTime)}",
+                    '${dateFormat.format(log.startTime)} → ${dateFormat.format(log.endTime)}',
                   ),
                   const SizedBox(height: 6),
                   _subRow(
-                    "Duration",
-                    "${_formatDuration(log.duration)} (${log.duration} min)",
+                    'Duration',
+                    '${_formatDuration(log.duration)} (${log.duration} min)',
                   ),
                 ],
               ),
             ),
 
-            _sectionHeader(context, "Route"),
+            _sectionHeader(context, 'Route'),
             _sectionCard(
               context,
               child: Column(
                 children: [
                   _airportBlock(
                     icon: Icons.flight_takeoff,
-                    title: "Departure",
+                    title: 'Departure',
                     loc: log.startLocation,
                   ),
                   const Divider(height: 24),
                   _airportBlock(
                     icon: Icons.flight_land,
-                    title: "Arrival",
+                    title: 'Arrival',
                     loc: log.endLocation,
                   ),
                   const Divider(height: 24),
                   _subRow(
-                    "Distance Flown",
-                    "${log.distanceFlown.toStringAsFixed(1)} NM",
+                    'Distance Flown',
+                    '${log.distanceFlown.toStringAsFixed(1)} NM',
                   ),
                 ],
               ),
             ),
 
-            _sectionHeader(context, "Performance"),
+            _sectionHeader(context, 'Performance'),
             _miniGrid(context, [
-              _metric("Avg Speed", "${log.avgAirspeed} kt"),
-              _metric("Max Alt", "${log.maxAltitude} ft"),
-              _metric("Cruise", "${log.cruiseTime} min"),
+              _metric('Avg Speed', '${log.avgAirspeed} kt'),
+              _metric('Max Alt', '${log.maxAltitude} ft'),
+              _metric('Cruise', '${log.cruiseTime} min'),
             ]),
 
-            _sectionHeader(context, "Flight Events"),
+            const SizedBox(height: 18),
+
+            _sectionHeader(context, 'Flight Events'),
             _sectionCard(
               context,
               child: Column(
                 children: [
                   _subRow(
-                    "Takeoff",
-                    log.events['takeoffScore']?.toString() ?? "N/A",
+                    'Takeoff',
+                    log.events['takeoffScore']?.toString() ?? 'N/A',
                   ),
                   _subRow(
-                    "Landing",
-                    log.events['butterScore']?.toString() ?? "N/A",
+                    'Landing',
+                    log.events['butterScore']?.toString() ?? 'N/A',
                   ),
                   _subRow(
-                    "Hard Landing",
-                    log.events['hardLanding'] == true ? "Yes" : "No",
+                    'Hard Landing',
+                    log.events['hardLanding'] == true ? 'Yes' : 'No',
                   ),
                 ],
               ),
             ),
 
-            _sectionHeader(context, "Turbulence"),
+            _sectionHeader(context, 'Turbulence'),
             _sectionCard(
               context,
               child: Column(
                 children: [
                   _subRow(
-                    "Light",
-                    "${log.events['turbulenceCount']['light']} events",
+                    'Light',
+                    '${((log.events['turbulenceCount'] ?? {})['light'] ?? 0)} events',
                   ),
                   _subRow(
-                    "Moderate",
-                    "${log.events['turbulenceCount']['moderate']} events",
+                    'Moderate',
+                    '${((log.events['turbulenceCount'] ?? {})['moderate'] ?? 0)} events',
                   ),
                   _subRow(
-                    "Severe",
-                    "${log.events['turbulenceCount']['severe']} events",
+                    'Severe',
+                    '${((log.events['turbulenceCount'] ?? {})['severe'] ?? 0)} events',
                   ),
                 ],
               ),
             ),
 
             const SizedBox(height: 20),
-            _mapButton(context, colors),
+
+            if (log.landing2d != null) ...[
+              _sectionHeader(context, 'Landing Replay'),
+              _sectionCard(
+                context,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Open the full landing replay with HUD, controls, replay clock, touchdown marker, and live sample data.',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _subRow(
+                      'Runway',
+                      _safe(log.landing2d!.runway, '—'),
+                    ),
+                    _subRow(
+                      'Touchdown VS',
+                      '${log.landing2d!.touchdownVerticalSpeed.toStringAsFixed(0)} fpm',
+                    ),
+                    _subRow(
+                      'Touchdown GS',
+                      '${log.landing2d!.touchdownGroundSpeed.toStringAsFixed(0)} kt',
+                    ),
+                    _subRow(
+                      'Rollout',
+                      '${log.landing2d!.rolloutSeconds} sec',
+                    ),
+                    const SizedBox(height: 14),
+                    FilledButton.icon(
+                      onPressed: () {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => LandingReplayScreen(
+                              landing: log.landing2d!,
+                              airportIcao: log.endLocation?.icao,
+                            ),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.open_in_full),
+                      label: const Text('Open Landing Replay'),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
 
-  // =========================
-  // ROUTE HEADER (ICAO + RWY + PARK)
-  // =========================
   Widget _routeHeader(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
 
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
       decoration: BoxDecoration(
-        color: colors.surfaceVariant.withOpacity(0.3),
+        color: colors.surfaceContainerHighest.withValues(alpha: 0.35),
         borderRadius: BorderRadius.circular(14),
       ),
       child: Row(
@@ -161,9 +211,9 @@ class FlightDetailsScreen extends StatelessWidget {
   }
 
   Widget _icaoStack(AirportLocation? loc) {
-    final icao = _safe(loc?.icao, "UNK");
-    final runway = _safe(loc?.runway, "—");
-    final parking = _safe(loc?.parking, "—");
+    final icao = _safe(loc?.icao, 'UNK');
+    final runway = _safe(loc?.runway, '—');
+    final parking = _safe(loc?.parking, '—');
 
     return Column(
       children: [
@@ -177,7 +227,7 @@ class FlightDetailsScreen extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Text(
-          "RWY $runway • P $parking",
+          'RWY $runway • P $parking',
           style: const TextStyle(
             fontSize: 12,
             color: Colors.grey,
@@ -188,9 +238,6 @@ class FlightDetailsScreen extends StatelessWidget {
     );
   }
 
-  // =========================
-  // AIRPORT BLOCK (DETAIL)
-  // =========================
   Widget _airportBlock({
     required IconData icon,
     required String title,
@@ -215,7 +262,7 @@ class FlightDetailsScreen extends StatelessWidget {
               ),
               const SizedBox(height: 6),
               Text(
-                _safe(loc?.icao, "UNK"),
+                _safe(loc?.icao, 'UNK'),
                 style: const TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.w800,
@@ -224,7 +271,7 @@ class FlightDetailsScreen extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                "Runway: ${_safe(loc?.runway, "—")}   •   Parking: ${_safe(loc?.parking, "—")}",
+                'Runway: ${_safe(loc?.runway, '—')}   •   Parking: ${_safe(loc?.parking, '—')}',
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -237,9 +284,6 @@ class FlightDetailsScreen extends StatelessWidget {
     );
   }
 
-  // =========================
-  // UI HELPERS
-  // =========================
   Widget _sectionCard(
     BuildContext context, {
     String? title,
@@ -251,9 +295,9 @@ class FlightDetailsScreen extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 18),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: colors.surfaceVariant.withOpacity(0.25),
+        color: colors.surfaceContainerHighest.withValues(alpha: 0.25),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: colors.outlineVariant.withOpacity(0.3)),
+        border: Border.all(color: colors.outline.withValues(alpha: 0.18)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -337,7 +381,9 @@ class FlightDetailsScreen extends StatelessWidget {
   }
 
   Widget _miniGrid(BuildContext context, List<Widget> items) {
-    return Row(children: items.map((w) => Expanded(child: w)).toList());
+    return Row(
+      children: items.map((w) => Expanded(child: w)).toList(),
+    );
   }
 
   Widget _metric(String title, String value) {
@@ -357,44 +403,13 @@ class FlightDetailsScreen extends StatelessWidget {
     );
   }
 
-  Widget _mapButton(BuildContext context, ColorScheme colors) {
-    return SizedBox(
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: () {
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => Scaffold(
-                appBar: AppBar(title: const Text("Flight Path Viewer")),
-                body: FlightRouteMap(trail: log.trail),
-              ),
-            ),
-          );
-        },
-        icon: const Icon(Icons.map),
-        label: const Text("View Flight on Map"),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: colors.primary,
-          foregroundColor: colors.onPrimary,
-          padding: const EdgeInsets.symmetric(vertical: 14),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
-        ),
-      ),
-    );
+  String _safe(String? v, String fallback) {
+    return (v == null || v.isEmpty) ? fallback : v;
   }
-
-  // =========================
-  // SMALL UTILS
-  // =========================
-  String _safe(String? v, String fallback) =>
-      (v == null || v.isEmpty) ? fallback : v;
 
   String _formatDuration(int mins) {
     final h = mins ~/ 60;
     final m = mins % 60;
-    return "${h}h ${m}m";
+    return '${h}h ${m}m';
   }
 }

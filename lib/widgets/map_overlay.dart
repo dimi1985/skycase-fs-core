@@ -18,8 +18,7 @@ class MapOverlay extends StatefulWidget {
   State<MapOverlay> createState() => _MapOverlayState();
 }
 
-class _MapOverlayState extends State<MapOverlay>
-    with SingleTickerProviderStateMixin {
+class _MapOverlayState extends State<MapOverlay> {
   late bool _visible;
   AircraftSnapshot? _snapshot;
 
@@ -32,36 +31,37 @@ class _MapOverlayState extends State<MapOverlay>
   @override
   void didUpdateWidget(covariant MapOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
+
     if (oldWidget.show != widget.show) {
-      setState(() => _visible = widget.show);
+      _visible = widget.show;
     }
   }
 
+  bool get _hasBusPower => widget.simData.mainBusVolts > 5.0;
+  bool get _avionicsOn => widget.simData.avionicsOn;
+  bool get _shouldDim => _hasBusPower && !_avionicsOn;
+  bool get _shouldBlackout => !_hasBusPower;
+
   @override
   Widget build(BuildContext context) {
-    final isFlying = !widget.simData.onGround;
+    if (!_visible) return const SizedBox.shrink();
 
     return Stack(
       children: [
-        // ✈️ Only show HUD when flying
-        if (isFlying && _visible)
-          Positioned(
-            bottom: 50,
-            left: 5,
-            child: powerDim(
-              widget.vibrate(
-                g1000Hud(context),
-              ),
+        Positioned(
+          bottom: 50,
+          left: 5,
+          child: _applyPowerState(
+            widget.vibrate(
+              _g1000Hud(context),
             ),
           ),
+        ),
       ],
     );
   }
 
-  // -------------------------
-  //   G1000 HUD (flying only)
-  // -------------------------
-  Widget g1000Hud(BuildContext context) {
+  Widget _g1000Hud(BuildContext context) {
     final d = widget.simData;
 
     return Container(
@@ -138,7 +138,11 @@ class _MapOverlayState extends State<MapOverlay>
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.navigation, color: Colors.orangeAccent, size: 12),
+              const Icon(
+                Icons.navigation,
+                color: Colors.orangeAccent,
+                size: 12,
+              ),
               const SizedBox(width: 3),
               Text(
                 "${heading.toStringAsFixed(0)}°",
@@ -155,15 +159,8 @@ class _MapOverlayState extends State<MapOverlay>
     );
   }
 
-  // -------------------------
-  //   Power Dim Logic
-  // -------------------------
-  Widget powerDim(Widget child) {
-    final battOn = widget.simData.mission.battery;
-    final avioOn = widget.simData.avionicsOn;
-
-    // Battery OFF → screen dead
-    if (!battOn) {
+  Widget _applyPowerState(Widget child) {
+    if (_shouldBlackout) {
       return ColorFiltered(
         colorFilter: const ColorFilter.mode(
           Colors.black,
@@ -173,8 +170,7 @@ class _MapOverlayState extends State<MapOverlay>
       );
     }
 
-    // Battery ON but avionics OFF → dim HUD
-    if (battOn && !avioOn) {
+    if (_shouldDim) {
       return Opacity(
         opacity: 0.25,
         child: child,

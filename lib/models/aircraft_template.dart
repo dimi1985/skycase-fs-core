@@ -5,9 +5,10 @@ class AircraftTemplate {
   final double fuelBurn;
   final double maxRangeNm;
 
-  // NEW ✨
-  final String fuelUnit;       // "gal", "lbs", "kg"
-  final double fuelDensity;    // 6.0 (Avgas) / 6.7 (Jet-A)
+  final String fuelUnit;
+  final double fuelDensity;
+
+  final int? maxPax;
 
   AircraftTemplate({
     required this.id,
@@ -17,19 +18,21 @@ class AircraftTemplate {
     required this.maxRangeNm,
     required this.fuelUnit,
     required this.fuelDensity,
+    this.maxPax,
   });
 
   factory AircraftTemplate.fromJson(Map<String, dynamic> json) {
     return AircraftTemplate(
       id: json['id'],
       name: json['name'],
-      cruiseSpeed: json['cruiseSpeed'].toDouble(),
-      fuelBurn: json['fuelBurn'].toDouble(),
-      maxRangeNm: json['maxRangeNm'].toDouble(),
-
-      // NEW (with fallback defaults)
-      fuelUnit: json['fuelUnit'] ?? "gal",
+      cruiseSpeed: (json['cruiseSpeed'] as num).toDouble(),
+      fuelBurn: (json['fuelBurn'] as num).toDouble(),
+      maxRangeNm: (json['maxRangeNm'] as num).toDouble(),
+      fuelUnit: json['fuelUnit'] ?? 'gal',
       fuelDensity: (json['fuelDensity'] ?? 6.0).toDouble(),
+      maxPax: json['maxPax'] == null
+          ? null
+          : (json['maxPax'] as num).toInt(),
     );
   }
 }

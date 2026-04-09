@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:skycase/providers/user_provider.dart';
 import 'package:skycase/screens/home_screen.dart';
 import 'package:skycase/services/auth_service.dart';
 import 'package:skycase/services/user_service.dart';
@@ -36,72 +38,73 @@ class _AuthScreenState extends State<AuthScreen> {
     super.dispose();
   }
 
-void _submit() async {
-  if (!_formKey.currentState!.validate()) return;
+  void _submit() async {
+    if (!_formKey.currentState!.validate()) return;
 
-  setState(() {
-    _isLoading = true;
-    _errorMessage = null;
-  });
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
 
-  final username = _usernameController.text.trim();
-  final email = _emailController.text.trim();
-  final password = _passwordController.text.trim();
+    final username = _usernameController.text.trim();
+    final email = _emailController.text.trim();
+    final password = _passwordController.text.trim();
 
-  try {
-    if (_isLogin) {
-      // ---- LOGIN FLOW ----
-      final loginResponse = await _authService.login(username, password);
+    try {
+      if (_isLogin) {
+        final loginResponse = await _authService.login(username, password);
 
-      // Save token
-      await SessionManager.saveToken(loginResponse.token);
+        await SessionManager.saveToken(loginResponse.token);
 
-      // Load full user profile
-      final fullProfile = await _userService.getProfile(loginResponse.token);
+        final fullProfile = await _userService.getProfile(loginResponse.token);
+
+        if (!mounted) return;
+
+        print('[LOGIN SUCCESS] Loaded profile for ${fullProfile.username}');
+
+        context.read<UserProvider>().setUser(fullProfile);
+
+        Navigator.of(
+          context,
+        ).pushReplacement(MaterialPageRoute(builder: (_) => HomeScreen()));
+      } else {
+        await _authService.register(username, email, password);
+
+        if (!mounted) return;
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Registration successful. Please login.'),
+          ),
+        );
+
+        setState(() {
+          _isLogin = true;
+        });
+      }
+    } catch (e, stack) {
+      print('[AUTH ERROR] $e');
+      print(stack);
+
+      final message = e.toString();
 
       if (!mounted) return;
 
-      print('[LOGIN SUCCESS] Loaded profile for ${fullProfile.username}');
+      setState(() {
+        _errorMessage = message;
+      });
 
-      // Navigate to HomeScreen WITH USER
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => HomeScreen(),
-        ),
-      );
-    } else {
-      // ---- REGISTRATION FLOW ----
-      await _authService.register(username, email, password);
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Registration successful. Please login.'),
-        ),
-      );
-
-      setState(() => _isLogin = true);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
-  } catch (e, stack) {
-    print('[AUTH ERROR] $e');
-    print(stack);
-    _errorMessage = e.toString();
   }
-
-  // Turn off loader
-  if (mounted) {
-    setState(() => _isLoading = false);
-  }
-
-  // Show error if any
-  if (_errorMessage != null && mounted) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(_errorMessage!)),
-    );
-  }
-}
-
 
   @override
   Widget build(BuildContext context) {

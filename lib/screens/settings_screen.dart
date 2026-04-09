@@ -3,8 +3,10 @@ import 'package:provider/provider.dart';
 import 'package:skycase/models/user.dart';
 import 'package:skycase/providers/auto_flight_provider.dart';
 import 'package:skycase/providers/auto_simlink_provider.dart';
+import 'package:skycase/providers/deep_zoom_provider.dart';
 import 'package:skycase/providers/efb_ui_mode_provider.dart';
 import 'package:skycase/providers/navigraph_provider.dart';
+import 'package:skycase/providers/simbrief_provider.dart';
 import 'package:skycase/providers/theme_provider.dart';
 import 'package:skycase/providers/unit_system_provider.dart';
 import 'package:skycase/providers/user_provider.dart';
@@ -30,6 +32,8 @@ class SettingsScreen extends StatelessWidget {
     final autoSimLinkProvider = context.watch<AutoSimLinkProvider>();
     final navProvider = context.watch<NavigraphProvider>();
     final efbModeProvider = context.watch<EfbUiModeProvider>();
+    final simBriefProvider = context.watch<SimBriefProvider>();
+    final deepZoomProvider = context.watch<DeepZoomProvider>();
     return Scaffold(
       appBar: AppBar(
         title: const Text('Settings'),
@@ -176,6 +180,55 @@ class SettingsScreen extends StatelessWidget {
           const SizedBox(height: 40),
 
           Text(
+            "Map",
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.bold,
+              color: colors.onBackground,
+            ),
+          ),
+
+          const SizedBox(height: 12),
+
+          ListTile(
+            leading: Icon(Icons.grid_view, color: colors.primary),
+            title: const Text("Deep Zoom Mode"),
+            subtitle: Text(
+              deepZoomProvider.mode == DeepZoomMode.keepTiles
+                  ? "Keep stretched tiles after native zoom"
+                  : "Use clean background after native zoom",
+              style: TextStyle(color: colors.onSurfaceVariant),
+            ),
+          ),
+
+          RadioListTile<DeepZoomMode>(
+            title: const Text("Keep Tiles"),
+            subtitle: const Text("Continue using tiles even if they get ugly"),
+            value: DeepZoomMode.keepTiles,
+            groupValue: deepZoomProvider.mode,
+            onChanged: (value) {
+              if (value != null) {
+                deepZoomProvider.setMode(value);
+              }
+            },
+          ),
+
+          RadioListTile<DeepZoomMode>(
+            title: const Text("Clean Background"),
+            subtitle: const Text(
+              "Switch to background and soft grid after native zoom",
+            ),
+            value: DeepZoomMode.cleanBackground,
+            groupValue: deepZoomProvider.mode,
+            onChanged: (value) {
+              if (value != null) {
+                deepZoomProvider.setMode(value);
+              }
+            },
+          ),
+
+          const SizedBox(height: 24),
+
+          Text(
             "Operations",
             style: theme.textTheme.titleMedium?.copyWith(
               fontWeight: FontWeight.bold,
@@ -200,6 +253,104 @@ class SettingsScreen extends StatelessWidget {
               );
             },
             secondary: Icon(Icons.tablet_mac, color: colors.primary),
+          ),
+
+          const SizedBox(height: 40),
+
+          Text(
+            "SimBrief",
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.bold,
+              color: colors.onBackground,
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          ListTile(
+            leading: Icon(Icons.cloud_sync, color: colors.primary),
+            title: const Text("SimBrief Credentials"),
+            subtitle: Text(
+              simBriefProvider.hasCredentials
+                  ? "User: ${simBriefProvider.username.isNotEmpty ? simBriefProvider.username : "-"}"
+                      "${simBriefProvider.pilotId.isNotEmpty ? " • Pilot ID: ${simBriefProvider.pilotId}" : ""}"
+                  : "Not configured",
+              style: TextStyle(color: colors.onSurfaceVariant),
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () async {
+              final usernameCtrl = TextEditingController(
+                text: simBriefProvider.username,
+              );
+              final pilotIdCtrl = TextEditingController(
+                text: simBriefProvider.pilotId,
+              );
+
+              final changed = await showDialog<bool>(
+                context: context,
+                builder: (context) {
+                  return AlertDialog(
+                    title: const Text("SimBrief Credentials"),
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextField(
+                          controller: usernameCtrl,
+                          decoration: const InputDecoration(
+                            labelText: "SimBrief Username",
+                            hintText: "e.g. jamespilot",
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: pilotIdCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: "SimBrief Pilot ID",
+                            hintText: "e.g. 123456",
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ],
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        child: const Text("Cancel"),
+                      ),
+                      TextButton(
+                        onPressed: () async {
+                          await context.read<SimBriefProvider>().clear();
+                          if (context.mounted) {
+                            Navigator.pop(context, true);
+                          }
+                        },
+                        child: const Text("Clear"),
+                      ),
+                      ElevatedButton(
+                        onPressed: () async {
+                          await context.read<SimBriefProvider>().save(
+                            username: usernameCtrl.text,
+                            pilotId: pilotIdCtrl.text,
+                          );
+
+                          if (context.mounted) {
+                            Navigator.pop(context, true);
+                          }
+                        },
+                        child: const Text("Save"),
+                      ),
+                    ],
+                  );
+                },
+              );
+
+              if (changed == true && context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text("SimBrief settings updated")),
+                );
+              }
+            },
           ),
 
           const SizedBox(height: 40),

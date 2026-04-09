@@ -5,18 +5,26 @@ class MapTileOption {
   final String url;
   final List<String> subdomains;
 
+  final Color mapBackgroundColor;
+  final Color fallbackGridColor;
+  final Color fallbackCrossColor;
+
   const MapTileOption({
     required this.name,
     required this.url,
-    this.subdomains = const ['a', 'b', 'c'],
+    this.subdomains = const [],
+    required this.mapBackgroundColor,
+    required this.fallbackGridColor,
+    required this.fallbackCrossColor,
   });
 }
 
 class MapTileSelector extends StatelessWidget {
   final int selectedIndex;
   final List<MapTileOption> tileOptions;
-  final void Function(int) onSelected;
-  final Color? iconColor; // <-- Add this
+  final ValueChanged<int> onSelected;
+  final Color? iconColor;
+
   const MapTileSelector({
     super.key,
     required this.selectedIndex,
@@ -31,24 +39,30 @@ class MapTileSelector extends StatelessWidget {
       icon: Icon(Icons.layers, color: iconColor ?? Colors.white),
       onSelected: onSelected,
       itemBuilder: (context) {
-        return tileOptions
-            .asMap()
-            .entries
-            .map(
-              (entry) => PopupMenuItem<int>(
-                value: entry.key,
-                child: Text(
-                  entry.value.name,
-                  style: TextStyle(
-                    fontWeight:
-                        selectedIndex == entry.key
-                            ? FontWeight.bold
-                            : FontWeight.normal,
+        return tileOptions.asMap().entries.map((entry) {
+          final index = entry.key;
+          final option = entry.value;
+
+          return PopupMenuItem<int>(
+            value: index,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    option.name,
+                    style: TextStyle(
+                      fontWeight: selectedIndex == index
+                          ? FontWeight.bold
+                          : FontWeight.normal,
+                    ),
                   ),
                 ),
-              ),
-            )
-            .toList();
+                if (selectedIndex == index)
+                  const Icon(Icons.check, size: 18),
+              ],
+            ),
+          );
+        }).toList();
       },
     );
   }

@@ -2,15 +2,16 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 import 'package:skycase/models/airport.dart';
 import 'package:skycase/models/airport_frequencies.dart';
 import 'package:skycase/models/airport_location.dart';
+import 'package:skycase/models/airway_segment.dart';
 import 'package:skycase/models/flight.dart';
 import 'package:skycase/models/flight_info.dart';
 import 'package:skycase/models/flight_log.dart';
@@ -20,31 +21,45 @@ import 'package:skycase/models/learned_aircraft.dart';
 import 'package:skycase/models/ndb.dart';
 import 'package:skycase/models/open_sky_aircraft.dart';
 import 'package:skycase/models/parking.dart';
+import 'package:skycase/models/poi.dart';
 import 'package:skycase/models/runways.dart';
 import 'package:skycase/models/simlink_data.dart';
+import 'package:skycase/models/taxiway_label.dart';
+import 'package:skycase/models/taxiway_segment.dart';
 import 'package:skycase/models/turbulence_event.dart';
 import 'package:skycase/models/vors.dart';
 import 'package:skycase/models/waypoints.dart';
 import 'package:skycase/providers/auto_flight_provider.dart';
 import 'package:skycase/providers/auto_simlink_provider.dart';
-import 'package:skycase/screens/ground_ops_screen.dart';
+import 'package:skycase/providers/deep_zoom_provider.dart';
+import 'package:skycase/providers/user_provider.dart';
+import 'package:skycase/screens/ground_ops/ground_ops_screen.dart';
 import 'package:skycase/services/aircraft_service.dart';
 import 'package:skycase/services/dispatch_service.dart';
 import 'package:skycase/services/distance_tracker.dart';
 import 'package:skycase/services/flight_log_service.dart';
 import 'package:skycase/services/flight_plan_service.dart';
+import 'package:skycase/services/ground_service.dart';
 import 'package:skycase/services/metar_service.dart';
 import 'package:skycase/services/simlink_socket_service.dart';
 import 'package:skycase/services/user_service.dart';
-import 'package:skycase/services/weather_engine_service.dart';
+import 'package:skycase/utils/airport_details_repository.dart';
 import 'package:skycase/utils/airport_repository.dart';
+import 'package:skycase/utils/airway_repository.dart';
 import 'package:skycase/utils/cockpit_vibration.dart';
+import 'package:skycase/utils/global_poi.dart';
+import 'package:skycase/utils/nav_repository.dart';
 import 'package:skycase/utils/navigraph_prefs.dart';
 import 'package:skycase/utils/session_manager.dart';
+import 'package:skycase/utils/waypoint_repository.dart';
+import 'package:skycase/widgets/aircraft_marker_icon.dart';
+import 'package:skycase/widgets/deep_zoom_grid_layer.dart';
 import 'package:skycase/widgets/map_overlay.dart';
 import 'package:skycase/widgets/map_tile_selector.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:skycase/widgets/navigraph_view.dart' show NavigraphWebview;
+import 'package:skycase/widgets/ndb_marker_painter.dart';
+import 'package:skycase/widgets/vor_marker_painter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:keep_screen_on/keep_screen_on.dart';
 
@@ -62,6 +77,58 @@ class LandingSnapshot {
     required this.icao,
     required this.time,
   });
+}
+
+class LandingReplaySample {
+  final double lat;
+  final double lng;
+  final double heading;
+  final double airspeed;
+  final double altitude;
+  final double verticalSpeed;
+  final bool onGround;
+  final DateTime timestamp;
+
+  LandingReplaySample({
+    required this.lat,
+    required this.lng,
+    required this.heading,
+    required this.airspeed,
+    required this.altitude,
+    required this.verticalSpeed,
+    required this.onGround,
+    required this.timestamp,
+  });
+
+  Landing2dSample toLanding2dSample() {
+    return Landing2dSample(
+      lat: lat,
+      lng: lng,
+      heading: heading,
+      airspeed: airspeed,
+      altitude: altitude,
+      verticalSpeed: verticalSpeed,
+      onGround: onGround,
+      timestamp: timestamp,
+    );
+  }
+}
+
+class LiveMapVisuals {
+  final List<Polyline> trailPolylines;
+  final List<Polyline> headingBugPolylines;
+  final List<Marker> markers;
+
+  const LiveMapVisuals({
+    required this.trailPolylines,
+    required this.headingBugPolylines,
+    required this.markers,
+  });
+
+  const LiveMapVisuals.empty()
+    : trailPolylines = const [],
+      headingBugPolylines = const [],
+      markers = const [];
 }
 
 class MapView extends StatefulWidget {
@@ -112,28 +179,29 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   final List<TurbulenceEvent> _turbulenceEvents = [];
 
+  static const double _lastRealTileZoom = 10.0;
+
   static const List<MapTileOption> tileLayers = [
     MapTileOption(
-      name: 'OpenStreetMap',
-      url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      name: 'SkyCase Dark',
+      url: 'http://38.242.241.46:8080/styles/skycase-dark/{z}/{x}/{y}.png',
+      subdomains: [],
+      mapBackgroundColor: Color(0xFF08121C),
+      fallbackGridColor: Color(0xFF5FA8D3),
+      fallbackCrossColor: Color(0xFF7FC4E8),
     ),
     MapTileOption(
-      name: 'TopoMap',
-      url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-    ),
-    MapTileOption(
-      name: 'Black',
-      url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    ),
-    MapTileOption(
-      name: 'White',
-      url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+      name: 'SkyCase Light',
+      url: 'http://38.242.241.46:8080/styles/skycase-light/{z}/{x}/{y}.png',
+      subdomains: [],
+      mapBackgroundColor: Color(0xFFEAF2F8),
+      fallbackGridColor: Color(0xFF7EA4C2),
+      fallbackCrossColor: Color(0xFF9BB9D1),
     ),
   ];
 
   DateTime? _startTime;
   DateTime? _endTime;
-  double _totalDistance = 0.0;
   double _maxAltitude = 0.0;
   double _airspeedSum = 0.0;
   int _airspeedSamples = 0;
@@ -145,7 +213,8 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   final Stopwatch _connectionTimer = Stopwatch();
   LatLng? _initialCenter;
 
-  List<Marker> _airportMarkers = [];
+  final ValueNotifier<List<Marker>> _airportMarkersNotifier =
+      ValueNotifier<List<Marker>>([]);
   Timer? _airportUpdateThrottle;
   bool _isConnected = false;
   bool _isConnecting = false;
@@ -155,7 +224,10 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   List<Map<String, dynamic>> _backendTrail = [];
   DateTime? _lastBackendTrailUpdate;
-
+  final List<LandingReplaySample> _landingReplayBuffer = [];
+  final List<LandingReplaySample> _landingReplayFinal = [];
+  bool _recordLandingRollout = false;
+  DateTime? _touchdownTime;
   DateTime? _cruiseStartCandidate;
   bool _cruiseConfirmed = false;
 
@@ -188,6 +260,15 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   bool _connectionInProgress = false;
 
   final bool _isLoadingAircraft = false;
+
+  String? _lastPushedJobPhase;
+  DateTime? _lastPhasePushTime;
+
+  bool _showPoi = false;
+
+  double _infoCardTop = 110;
+  double _infoCardLeft = 0;
+  bool _infoCardInitialized = false;
 
   double minutesUntilTOD() {
     final speedKt = (simData?.airspeed ?? 120).clamp(60, 400);
@@ -236,18 +317,91 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   FlightInfo? _selectedInfo;
   bool _hasEverConnected = false;
   Timer? _heartbeatTimer;
+  bool _userTouchingMap = false;
+  Timer? _touchReleaseTimer;
+  bool _isFinalizingFlight = false;
+  Poi? _selectedPoi;
+
+  bool _showSideMenu = false;
+
+  dynamic _selectedMapObject;
+  String? _selectedMapObjectType; // 'vor' | 'ndb' | 'parking' | 'waypoint'
+
+  Poi? _nearbyPoiAlert;
+  DateTime? _lastPoiAlertTime;
+  final Map<String, DateTime> _dismissedPoiAlerts = {};
+
+  static const double _poiAlertRangeNm = 15.0;
+  static const Duration _poiAlertCooldown = Duration(minutes: 3);
+
+  Poi? _activePoiTarget;
+  DateTime? _poiInsideSince;
+  bool _poiReached = false;
+
+  static const double _poiReachRadiusNm = 1.5;
+
+  final Set<String> _confirmedPoiNames = {};
+
+  Duration get _requiredPoiHoldTime =>
+      isHelicopter ? const Duration(seconds: 20) : const Duration(seconds: 10);
+
+  Timer? _groundOverlayThrottle;
+
+  // =============== AIRWAY STATE ===============
+  List<AirwaySegment> _airways = [];
+  final ValueNotifier<List<Polyline>> _airwayPolylinesNotifier =
+      ValueNotifier<List<Polyline>>([]);
+  Timer? _airwayThrottle;
+  double? _lastAirwayZoom;
+  LatLngBounds? _lastAirwayBounds;
+  bool _showAirways = false;
+  final ValueNotifier<List<Marker>> _airwayLabelsNotifier =
+      ValueNotifier<List<Marker>>([]);
+
+  final ValueNotifier<List<Marker>> _parkingMarkersNotifier =
+      ValueNotifier<List<Marker>>([]);
+
+  final ValueNotifier<List<Marker>> _vorMarkersNotifier =
+      ValueNotifier<List<Marker>>([]);
+
+  final ValueNotifier<List<Marker>> _ndbMarkersNotifier =
+      ValueNotifier<List<Marker>>([]);
+
+  final ValueNotifier<List<Marker>> _waypointMarkersNotifier =
+      ValueNotifier<List<Marker>>([]);
+
+  final ValueNotifier<LiveMapVisuals> _liveMapVisualsNotifier =
+      ValueNotifier<LiveMapVisuals>(const LiveMapVisuals.empty());
+
+  String? _cinematicHudMessage;
+  IconData? _cinematicHudIcon;
+  Color _cinematicHudAccent = Colors.cyanAccent;
+  Timer? _cinematicHudTimer;
+
+  late final AnimationController _hudFxController;
+
+  late AnimationController _aircraftSpinController;
+
+  static const double kTileFadeCutoffZoom = 10.8;
+
+  LatLng? _endCheckStartPos;
+  DateTime? _endCheckSince;
+  DateTime? _endFlightLostSince;
 
   @override
   void initState() {
     super.initState();
     _connectionTimer.start();
 
-    // 1️⃣ Load in-flight FIRST
-    _loadInFlight();
+    // 1️⃣ Restore UI shell first
+_loadUiShellState();
 
-    // 2️⃣ StartPoint + Trail
-    _loadStartPoint();
-    _loadTrail();
+// 2️⃣ Restore runtime flight snapshot
+_loadInFlight();
+
+// 3️⃣ StartPoint + Trail
+_loadStartPoint();
+_loadTrail();
 
     // 3️⃣ Airports + Flight + Center
     // 3️⃣ Airports + Flight + Center
@@ -260,9 +414,12 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     // 4️⃣ Rotation controller
     _rotationController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 300),
+      duration: const Duration(milliseconds: 500),
     )..addListener(() {
-      if (_mapReady && _followAircraft && simData != null) {
+      if (_mapReady &&
+          _followAircraft &&
+          !_userTouchingMap &&
+          simData != null) {
         try {
           final angle = _rotationAnimation.value;
           mapController.rotate(angle);
@@ -286,8 +443,12 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
           event.source == MapEventSource.scrollWheel ||
           event.source == MapEventSource.doubleTap ||
           event.source == MapEventSource.onMultiFinger) {
-        if (mounted) setState(() {});
         _throttledUpdateAirportMarkers();
+        _throttledUpdateAirways();
+        _throttledUpdateParkingMarkers();
+        _throttledUpdateVorMarkers();
+        _throttledUpdateNdbMarkers();
+        _throttledUpdateWaypointMarkers();
       }
     });
 
@@ -300,6 +461,8 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       begin: 1.0,
       end: 0.0,
     ).animate(CurvedAnimation(parent: _fadeController, curve: Curves.easeOut));
+
+    _fadeController.removeListener(_refreshLiveMapVisuals);
 
     _loadMapStyle();
 
@@ -346,6 +509,16 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       vsync: this,
       duration: const Duration(milliseconds: 900),
     )..repeat();
+
+    _hudFxController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    );
+
+    _aircraftSpinController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 220),
+    )..repeat();
   }
 
   bool get isClimbing => (simData?.verticalSpeed ?? 0) > 200;
@@ -360,71 +533,265 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   bool get atCruiseAltitude {
     if (_currentFlight?.cruiseAltitude == null || simData == null) return false;
-    final cruise = _currentFlight!.cruiseAltitude!;
+    final cruise = _currentFlight!.cruiseAltitude;
     return simData!.altitude >= cruise - 200 &&
         simData!.altitude <= cruise + 300;
+  }
+
+  double _buildAircraftRotationAngle() {
+    final s = simData;
+    if (s == null) return 0.0;
+
+    final double airspeed = s.airspeed;
+    final double heading = s.heading;
+
+    // Helicopter hovering → north-up
+    if (isHelicopter && airspeed < 20) return 0.0;
+
+    final normalized = (heading % 360 + 360) % 360;
+    return normalized * (pi / 180);
+  }
+
+  void _refreshLiveMapVisuals() {
+    final List<Polyline> trailPolylines = [];
+    final List<Polyline> headingBugPolylines = [];
+    final List<Marker> markers = [];
+
+    // --------------------------------------------------
+    // Trail
+    // --------------------------------------------------
+    if (_trail.length > 1) {
+      trailPolylines.add(
+        Polyline(
+          points: List<LatLng>.from(_trail),
+          strokeWidth: 4.0,
+          color: _getTrailColor(simData?.altitude ?? 0),
+        ),
+      );
+    }
+
+    // --------------------------------------------------
+    // Heading bug dotted line
+    // --------------------------------------------------
+    if (_aircraftLatLng != null && _headingBugTarget != null) {
+      final dots = buildDottedLine(
+        _aircraftLatLng!,
+        _headingBugTarget!,
+        dotSpacingMeters: 350,
+      );
+
+      for (int i = 0; i < dots.length - 1; i += 2) {
+        headingBugPolylines.add(
+          Polyline(
+            points: [dots[i], dots[i + 1]],
+            color: Colors.cyanAccent.withOpacity(_fadeAnimation.value),
+            strokeWidth: 2.5,
+          ),
+        );
+      }
+    }
+
+    // --------------------------------------------------
+    // Aircraft marker
+    // --------------------------------------------------
+    if (simData != null) {
+      markers.add(
+        Marker(
+          width: 44,
+          height: 44,
+          point: LatLng(simData!.latitude, simData!.longitude),
+          child: AnimatedBuilder(
+            animation: _aircraftSpinController,
+            builder: (context, _) {
+              return AircraftMarkerIcon(
+                data: simData!,
+                rotationAngle: _buildAircraftRotationAngle(),
+                spinPhase: _aircraftSpinController.value,
+                color: _getMarkerColor(tileLayers[_mapStyleIndex].name),
+                size: 44,
+              );
+            },
+          ),
+        ),
+      );
+    }
+
+    // --------------------------------------------------
+    // Home base marker
+    // --------------------------------------------------
+    if (_homeBase != null) {
+      markers.add(
+        Marker(
+          point: _homeBase!,
+          width: 30,
+          height: 30,
+          child: IgnorePointer(
+            ignoring: true,
+            child: Tooltip(
+              message: 'Home Base',
+              child: Icon(
+                Icons.home,
+                color: Colors.blueAccent,
+                size: 28,
+                shadows: [Shadow(blurRadius: 5, color: Colors.black45)],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // --------------------------------------------------
+    // Last destination marker
+    // --------------------------------------------------
+    if (_lastFlightDestination != null) {
+      markers.add(
+        Marker(
+          point: _lastFlightDestination!,
+          width: 30,
+          height: 30,
+          child: Tooltip(
+            message: 'Last Flight Destination',
+            child: Icon(
+              Icons.airplane_ticket,
+              color: Colors.lightGreenAccent,
+              size: 28,
+              shadows: [Shadow(blurRadius: 5, color: Colors.black45)],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // --------------------------------------------------
+    // Turbulence markers
+    // --------------------------------------------------
+    for (final event in _turbulenceEvents) {
+      markers.add(
+        Marker(
+          width: 16,
+          height: 16,
+          point: event.location,
+          child: Container(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _getTurbulenceColor(event.severity),
+              border: Border.all(color: Colors.redAccent, width: 2),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // --------------------------------------------------
+    // Flight history markers
+    // --------------------------------------------------
+    if (_showAllFlights) {
+      markers.addAll(_buildFlightHistoryMarkers());
+    }
+
+    _liveMapVisualsNotifier.value = LiveMapVisuals(
+      trailPolylines: trailPolylines,
+      headingBugPolylines: headingBugPolylines,
+      markers: markers,
+    );
   }
 
   /// Handle incoming real-time sim data
   void _handleSimUpdate(SimLinkData data) async {
     if (!mounted) return;
-    final phase = _computePhase(data);
+    // debugPrint(
+    //   "BATTERY CHECK | mission.battery=${data.mission.battery} | volts=${data.mainBusVolts} | avionics=${data.avionicsOn} | combustion=${data.combustion}",
+    // );
+    _updateNearbyPoiAlert();
+    _updatePoiProximityTimer();
+    final now = DateTime.now();
+    final latlng = LatLng(data.latitude, data.longitude);
 
-    await CockpitVibration.onPhaseChange(phase);
+    _lastSocketData = now;
 
     // -------------------------------------------------------
-    // PHASE CHANGE ANNOUNCER (no spam, no duplicates)
+    // SETTINGS / POWER / BASIC STATE
     // -------------------------------------------------------
-    if (phase != _lastAnnouncedPhase) {
-      _lastAnnouncedPhase = phase;
+    if (!_settingsLoaded) return;
 
-      switch (phase) {
-        case GroundPhase.taxi:
-          showHudMessage("🚕 Taxi");
-          break;
+    final double volts = data.mainBusVolts;
+    final bool avionics = data.avionicsOn;
 
-        case GroundPhase.roll:
-          // ❌ Do nothing — runway latch handles this
-          break;
-
-        case GroundPhase.parked:
-          showHudMessage("🅿️ Parked");
-          break;
-
-        case GroundPhase.airborne:
-          // Do nothing — takeoff logic already announces this
-          break;
+    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+      if (volts > 7 && avionics) {
+        KeepScreenOn.turnOn();
+      } else {
+        KeepScreenOn.turnOff();
       }
     }
+
+    _qualifyFlightIfNeeded(data);
+
     // -------------------------------------------------------
-    // RUNWAY ALIGNMENT DETECTION (after entry, before roll)
+    // INITIAL GROUND STATE
+    // -------------------------------------------------------
+    _isGrounded ??= data.onGround;
+
+    // -------------------------------------------------------
+    // MID-AIR ATTACH
+    // -------------------------------------------------------
+    if (!_flightSessionActive &&
+        !data.onGround &&
+        data.airspeed > 40 &&
+        data.altitude > 150) {
+      final prefs = await SharedPreferences.getInstance();
+      await DistanceTracker.reset();
+      DistanceTracker.start();
+
+      _startFlight();
+      _flightSessionActive = true;
+      _inFlight = true;
+      _flightQualified = true;
+
+      await prefs.setBool('in_flight', true);
+      await _saveFlightRuntimeSnapshot();
+
+      _livePhase = GroundPhase.airborne;
+      _lastAnnouncedPhase = GroundPhase.airborne;
+      await CockpitVibration.onPhaseChange(GroundPhase.airborne);
+
+      _pendingPhase = null;
+      _pendingPhaseSince = null;
+    }
+
+    // -------------------------------------------------------
+    // PHASE UPDATE (STRICT / MEANINGFUL ONLY)
+    // -------------------------------------------------------
+    final GroundPhase? rawPhase = _computePhase(data);
+    await _updateMeaningfulPhase(data, rawPhase, now);
+
+    // -------------------------------------------------------
+    // RUNWAY ALIGNMENT DETECTION
+    // Only if we're active and not already airborne/final parked
     // -------------------------------------------------------
     final bool runwayLike =
         data.onGround &&
         data.airspeed < 15 &&
-        _computePhase(data) != GroundPhase.parked;
+        rawPhase != null &&
+        rawPhase != GroundPhase.parked;
 
     if (_inFlight && _runwayUsedDeparture == 'N/A' && runwayLike) {
-      final now = DateTime.now();
       final heading = data.heading;
 
       if (_lastHeadingForRunway == null ||
           (heading - _lastHeadingForRunway!).abs() > 5) {
-        // Still turning → reset stability window
         _lastHeadingForRunway = heading;
         _headingStableSince = now;
       } else {
-        // Heading stable
         final stableSeconds =
-            now.difference(_headingStableSince!).inMilliseconds / 1000;
+            now.difference(_headingStableSince ?? now).inMilliseconds / 1000.0;
 
         if (stableSeconds >= 2.0) {
-          final latlng = LatLng(data.latitude, data.longitude);
-          final rwy = _detectRunway(latlng);
+          final rwy = _detectRunwayStrict(latlng);
 
           if (rwy != null) {
             _runwayUsedDeparture = rwy;
-            showHudMessage("🛫 Lined up — RWY $_runwayUsedDeparture");
           }
         }
       }
@@ -435,70 +802,19 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     // -------------------------------------------------------
     if (_runwayPhaseLatched) {
       final bool exitedRunway =
-          !data.onRunway &&
-          data.onGround &&
-          data.airspeed < 40; // realistic rollout threshold
+          !data.onRunway && data.onGround && data.airspeed < 40;
 
       if (exitedRunway) {
         _runwayPhaseLatched = false;
-        showHudMessage("🚕 Taxi — Runway Vacated");
       }
     }
 
-    if (!_settingsLoaded) return;
-
-    // -------------------------------
-    // RUNWAY LOCK (ROLL DETECTION)
-    // -------------------------------
+    // -------------------------------------------------------
+    // RUNWAY LOCK
+    // -------------------------------------------------------
     if (data.onRunway && data.airspeed > 30) {
       _runwayLock = true;
       _runwayExitCandidate = null;
-    }
-
-    final double volts = data.mainBusVolts;
-    final bool avionics = data.avionicsOn;
-
-    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
-      // Realistic screen power logic for mobile only
-      if (volts > 7 && avionics) {
-        KeepScreenOn.turnOn(); // or Wakelock.enable();
-      } else {
-        KeepScreenOn.turnOff(); // or Wakelock.disable();
-      }
-    }
-
-    final now = DateTime.now();
-    final latlng = LatLng(data.latitude, data.longitude);
-    _lastSocketData = now;
-    _qualifyFlightIfNeeded(data);
-
-    // -------------------------------------------------------
-    // ⭐ GROUND INITIALIZATION FIX
-    //   Initialize _isGrounded ONLY ONCE for the first packet
-    // -------------------------------------------------------
-    _isGrounded ??= data.onGround;
-
-    // -------------------------------------------------------
-    // ⭐ MID-AIR ATTACH FIX
-    //   If we connect while already airborne → start flight
-    // -------------------------------------------------------
-    if (!_flightSessionActive &&
-        !data.onGround &&
-        data.airspeed > 40 &&
-        data.altitude > 150) {
-      final prefs = await SharedPreferences.getInstance();
-      await DistanceTracker.reset();
-      DistanceTracker.start();
-      _startFlight();
-      _flightSessionActive = true;
-      _inFlight = true;
-      await prefs.setBool('in_flight', true);
-
-      _flightQualified = true;
-      showHudMessage(
-        "🛫 Auto Flight Attached (Mid-Air)\n"
-        "🧭 PHASE: ${phase != null ? _phaseLabel(phase) : '--'}",
-      );
     }
 
     // -------------------------------------------------------
@@ -515,26 +831,30 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       _computeTocTodPoints();
     }
 
-    // ----------------------
-    // TOC AUTO-HIDE LOGIC
-    // ----------------------
+    // -------------------------------------------------------
+    // TOC AUTO-HIDE
+    // -------------------------------------------------------
     if (_tocPoint != null) {
       if (atCruiseAltitude ||
-          simData!.altitude > _currentFlight!.cruiseAltitude!) {
+          (simData != null &&
+              _currentFlight != null &&
+              simData!.altitude > _currentFlight!.cruiseAltitude)) {
         _tocPoint = null;
       }
     }
 
-    // ----------------------
-    // TOD AUTO-HIDE LOGIC
-    // ----------------------
+    // -------------------------------------------------------
+    // TOD AUTO-HIDE
+    // -------------------------------------------------------
     if (_todPoint != null) {
       if (!atCruiseAltitude) _todPoint = null;
       if (isDescending) _todPoint = null;
       if (_remainingNm < _todDistanceNm) _todPoint = null;
     }
 
-    // Heading bug fade logic
+    // -------------------------------------------------------
+    // HEADING BUG FADE
+    // -------------------------------------------------------
     final headingBug = data.autopilot.headingBug;
     if (_lastHeadingBug == null || _lastHeadingBug != headingBug) {
       _lastHeadingBug = headingBug;
@@ -545,77 +865,67 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       });
     }
 
-    final s = simData;
+    // -------------------------------------------------------
+    // TOC / TOD DISTANCES
+    // NOTE: use current packet, not old simData snapshot
+    // -------------------------------------------------------
+    if (_currentFlight != null) {
+      final selectedAlt = data.autopilot.altitudeTarget;
 
-    if (_currentFlight != null && s != null) {
-      final selectedAlt = s.autopilot.altitudeTarget;
-
-      // --- TOC ---
-      if (s.verticalSpeed > 200 && s.altitude < selectedAlt - 100) {
+      if (data.verticalSpeed > 200 && data.altitude < selectedAlt - 100) {
         _tocDistanceNm = calculateTOCDistanceNm();
       } else {
         _tocDistanceNm = 0;
       }
 
-      // --- TOD ---
       final destElev =
           _currentFlight!.destinationLat != null
               ? (_destinationElevationFt ?? 0)
               : 0;
 
-      if (_cruiseConfirmed && s.altitude >= selectedAlt - 100) {
+      if (_cruiseConfirmed && data.altitude >= selectedAlt - 100) {
         _todDistanceNm = calculateTODDistanceNm(destElev);
       } else {
         _todDistanceNm = 0;
       }
     }
 
-    // Update aircraft state
+    // -------------------------------------------------------
+    // UPDATE AIRCRAFT STATE
+    // -------------------------------------------------------
     _aircraftLatLng = latlng;
     _aircraftHeading = data.heading;
     _headingBugTarget = _computeTargetFromHeading(latlng, headingBug, 30.0);
 
+    _refreshLiveMapVisuals();
+
     // -------------------------------------------------------
-    // TAKEOFF DETECTION (Ground → Air)
+    // TAKEOFF DETECTION (EVENT)
     // -------------------------------------------------------
     if (_isGrounded == true && data.onGround == false) {
-      final pitch = data.pitch;
-
-      _lastTakeoffRating = takeoffGradeFromPitch(pitch);
-      showHudMessage(
-        "🛫 Takeoff: $_lastTakeoffRating (${pitch.toStringAsFixed(1)}°)\n"
-        "🧭 PHASE: ${phase != null ? _phaseLabel(phase) : '--'}",
-      );
-
-      _recordedTakeoffPitch = pitch;
+      await _handleTakeoffEvent(data: data, now: now);
     }
 
-    // ------------------------------
+    // -------------------------------------------------------
     // AUTO START (taxi out)
-    // ------------------------------
+    // -------------------------------------------------------
     if (_autoFlightEnabled && !_flightSessionActive) {
       final bool shouldStart =
           data.onGround && data.combustion && data.airspeed > 8;
 
       if (shouldStart) {
-        print("🟢 AUTO: Flight START — Taxi detected");
-
-        // 🔒 HARD LOCK — prevents flashing
         _flightSessionActive = true;
         _inFlight = true;
+        _takeoffTimestamp = now;
+        _finalParkedAnnounced = false;
 
         final prefs = await SharedPreferences.getInstance();
-        _takeoffTimestamp = DateTime.now();
         await DistanceTracker.reset();
         DistanceTracker.start();
+        await prefs.setBool('in_flight', true);
+        await _saveFlightRuntimeSnapshot();
 
         _startFlight();
-        await prefs.setBool('in_flight', true);
-
-        showHudMessage(
-          "🟢 Auto Flight Started (Taxi)\n"
-          "🧭 PHASE: ${_phaseLabel(phase)}",
-        );
       }
     }
 
@@ -624,10 +934,8 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     // -------------------------------------------------------
     _fuelGallons = data.fuelGallons;
 
-    // Estimate burn rate
-    double gph = _estimateFuelFlow();
+    final double gph = _estimateFuelFlow();
 
-    // Avoid divide-by-zero
     if (gph > 0) {
       _fuelMinutesLeft = (_fuelGallons / gph) * 60.0;
     } else {
@@ -658,148 +966,219 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     _lowFuel = newLowFuel;
     _fuelEmergency = newEmergency;
 
+    _captureLandingReplaySample(data, now);
+
     // -------------------------------------------------------
-    // LANDING DETECTION (Air → Ground)
+    // LANDING DETECTION (EVENT)
     // -------------------------------------------------------
     if (_isGrounded == false && data.onGround == true) {
-      final vs = data.verticalSpeed;
-
-      if (!await _recentLanding()) {
-        _lastLandingRating = landingGradeFromVs(vs);
-        showHudMessage(
-          "🧈 Landing: $_lastLandingRating (VS: ${vs.toStringAsFixed(0)} fpm)",
-        );
-        await _markLanding();
-      }
-    }
-
-    // -------------------------------------------------------
-    // 🛬 LANDING SNAPSHOT (RUNWAY / ICAO LOCK)
-    // -------------------------------------------------------
-    if (_isGrounded == false &&
-        data.onGround == true &&
-        _landingSnapshot == null) {
-      final pos = LatLng(data.latitude, data.longitude);
-
-      final runway =
-          (!isHelicopter || helicopterHasWheels) ? _detectRunway(pos) : null;
-
-      final icao = _toAirportLocation(pos)?.icao;
-
-      _landingSnapshot = LandingSnapshot(
-        position: pos,
-        runway: runway,
-        icao: icao,
-        time: DateTime.now(),
+      await _handleLandingEvent(
+        data: data,
+        latlng: latlng,
+        now: now,
+        isHelicopter: isHelicopter,
+        helicopterHasWheels: helicopterHasWheels,
       );
-
-      print("🛬 Landing SNAPSHOT → ICAO=$icao RWY=${runway ?? 'UNK'}");
     }
+    // -------------------------------------------------------
+    // AUTO END (REAL FINAL PARKING ONLY)
+    // supports grass/dirt/gravel strips without parking
+    // reuses existing runway detection
+    // -------------------------------------------------------
+    if (_autoFlightEnabled &&
+        _flightSessionActive &&
+        _startPoint != null &&
+        !_isFinalizingFlight) {
+      final bool stableStopped = _isStableStopped(data, latlng);
 
-    // ------------------------------
-    // AUTO END (parked & shutdown)
-    // ------------------------------
-    if (_autoFlightEnabled && _flightSessionActive && _startPoint != null) {
-      final shouldConsiderParking =
-          data.onGround &&
-          !data.onRunway &&
-          data.parkingBrake &&
-          !data.combustion;
+      final detectedIdent = _detectRunwayStrict(latlng);
+      final matchedRunway = _getRunwayByIdent(detectedIdent);
+      final surface = matchedRunway?.surface.trim().toUpperCase() ?? '';
 
-      // 1️⃣ First detection of real parking intent
-      if (shouldConsiderParking && !_pendingFlightEnd) {
-        _pendingFlightEnd = true;
-        _pendingEndTime = DateTime.now();
+      final bool softField =
+          surface == 'G' || surface == 'D' || surface == 'GR';
 
-        showHudMessage("🅿️ Parked — monitoring shutdown...");
+      final bool runwayUnsafe =
+          !softField && !isHelicopter && data.onRunway && data.airspeed < 20;
+
+      String? parkingHere;
+      final airportIcao = _toAirportLocation(latlng)?.icao;
+      if (airportIcao != null) {
+        parkingHere = detectParkingSpot(
+          latlng,
+          icao: airportIcao,
+          requireFullyParked: true,
+        );
       }
 
-      // 2️⃣ Confirm after stability window
-      if (_pendingFlightEnd) {
-        final stableFor = DateTime.now().difference(_pendingEndTime!).inSeconds;
+      final bool validParking = parkingHere != null;
+      final bool parkingBrakeHelps = data.parkingBrake;
 
-        if (stableFor >= 10) {
-          await _finalizeAndUploadFlight();
+      final bool enoughTimeAfterTouchdown =
+          _touchdownTime == null ||
+          now.difference(_touchdownTime!).inSeconds >= 20;
 
+      final bool shouldFinalize =
+          stableStopped &&
+          enoughTimeAfterTouchdown &&
+          (softField || !runwayUnsafe) &&
+          (validParking || parkingBrakeHelps || softField || isHelicopter);
+
+      if (shouldFinalize) {
+        _endFlightLostSince = null;
+        _pendingFlightEnd = true;
+        _pendingEndTime ??= now;
+
+        await _saveFlightRuntimeSnapshot();
+
+        final stableFor = now.difference(_pendingEndTime!).inSeconds;
+
+        if (stableFor >= 12) {
+          if (!_finalParkedAnnounced) {
+            _finalParkedAnnounced = true;
+            await CockpitVibration.onPhaseChange(GroundPhase.parked);
+          }
+
+          _isFinalizingFlight = true;
+
+          try {
+            final didSave = await _finalizeAndUploadFlight();
+
+            if (didSave) {
+              _pendingFlightEnd = false;
+              _pendingEndTime = null;
+              _endFlightLostSince = null;
+              _endCheckStartPos = null;
+              _endCheckSince = null;
+              _inFlight = false;
+              _flightSessionActive = false;
+                await _clearFlightRuntimeSnapshot();
+            } else {
+              _pendingFlightEnd = false;
+              _pendingEndTime = null;
+              _endFlightLostSince = null;
+            }
+          } finally {
+            _isFinalizingFlight = false;
+          }
+        }
+      } else {
+        _endFlightLostSince ??= now;
+
+        final lostFor = now.difference(_endFlightLostSince!).inSeconds;
+        if (lostFor >= 4) {
           _pendingFlightEnd = false;
           _pendingEndTime = null;
-          _inFlight = false;
-          _flightSessionActive = false;
-
-          showHudMessage("🔴 Flight Ended — Parked");
+          _finalParkedAnnounced = false;
+          _endFlightLostSince = null;
         }
       }
     }
+    // -------------------------------------------------------
+    // JOB PHASE ENGINE
+    // -------------------------------------------------------
+    final gsx = data.gsx;
+
+    if (gsx.availableInSim && gsx.boarding) {
+      await _pushJobPhase('loading');
+    } else if (gsx.availableInSim &&
+        !gsx.boarding &&
+        !gsx.refueling &&
+        data.onGround &&
+        data.parkingBrake &&
+        data.combustion) {
+      await _pushJobPhase('ready');
+    }
+
+    if (gsx.availableInSim && gsx.deboarding) {
+      await _pushJobPhase('unloading');
+    }
 
     // -------------------------------------------------------
-    // UPDATE GROUND STATE LAST (IMPORTANT)
+    // UPDATE GROUND STATE LAST
     // -------------------------------------------------------
     _isGrounded = data.onGround;
 
-    // Turbulence detection
+    // -------------------------------------------------------
+    // TURBULENCE
+    // -------------------------------------------------------
     _handleTurbulenceDetection(data, now, latlng);
 
-    // Teleport/lag detection
+    // -------------------------------------------------------
+    // TELEPORT / LAG DETECTION
+    // -------------------------------------------------------
     final timeDelta =
         _lastFixTime != null ? now.difference(_lastFixTime!).inSeconds : 0;
     _lastFixTime = now;
 
     if (_inFlight && _trail.isNotEmpty) {
       final last = _trail.last;
-
-      // Aviation-accurate distance
       final distNm = _calculateDistanceNm(last, latlng);
       final distKm = distNm * 1.852;
-
       final isLegitMovement = data.airspeed > 40;
 
-      // Anti-teleport filter
       if (distKm > 10 && timeDelta < 8 && !isLegitMovement) {
-        print(
-          "🛑 Ignored jump (${distKm.toStringAsFixed(1)} km / ${timeDelta}s)",
-        );
         return;
       }
     }
 
-    // Ensure distance tracking start reference
+    // -------------------------------------------------------
+    // DISTANCE TRACKER REFERENCE
+    // -------------------------------------------------------
     if (_inFlight && _lastDistancePoint == null) {
       _lastDistancePoint = latlng;
     }
 
-    // Track flight stats
+    // -------------------------------------------------------
+    // TRACK FLIGHT STATS
+    // -------------------------------------------------------
     if (_inFlight) {
       await DistanceTracker.feed(latlng);
       _trackFlightStats(data, latlng, now);
     }
 
-    // Follow-aircraft camera
-    if (_followAircraft && _mapReady) {
+    // -------------------------------------------------------
+    // FOLLOW-AIRCRAFT CAMERA
+    // -------------------------------------------------------
+    if (_followAircraft && _mapReady && !_userTouchingMap) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
+
         try {
           mapController.move(latlng, mapController.camera.zoom);
-          _animateRotation(data.heading);
+
+          // Rotate whenever follow is active.
+          // Only keep north-up for hovering helicopters if desired.
+          if (!(isHelicopter && data.airspeed < 20)) {
+            _animateRotation(data.heading);
+          } else {
+            mapController.rotate(0);
+            _mapRotation = 0.0;
+            _previousHeading = 0.0;
+          }
         } catch (_) {}
       });
     }
 
     // -------------------------------------------------------
-    // TRAIL (visual)
+    // TRAIL (VISUAL)
     // -------------------------------------------------------
     if (_inFlight && !data.onGround) {
       final last = _trail.isNotEmpty ? _trail.last : null;
-
       final movedMeters =
           last == null ? 999.0 : _calculateDistanceNm(last, latlng) * 1852.0;
 
       if (movedMeters >= 1.0) {
         _trail.add(latlng);
-        _saveTrail(_trail);
+_refreshLiveMapVisuals();
+await _saveTrail(_trail);
+await _saveFlightRuntimeSnapshot();
       }
     }
 
-    // Backend trail (every 15s or 30m)
+    // -------------------------------------------------------
+    // BACKEND TRAIL
+    // -------------------------------------------------------
     if (_inFlight) {
       final lastBackend =
           _backendTrail.isNotEmpty
@@ -813,8 +1192,7 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
       final distFromLast =
           lastBackend != null
-              ? _calculateDistanceNm(lastBackend, latlng) *
-                  1.852 // NM → KM
+              ? _calculateDistanceNm(lastBackend, latlng) * 1.852
               : null;
 
       if (lastBackend == null ||
@@ -827,29 +1205,52 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
         });
 
         _lastBackendTrailUpdate = now;
+        await _saveFlightRuntimeSnapshot();
       }
     }
 
-    // Rebuild UI
     if (!mounted) return;
-    setState(() => simData = data);
+
+    // simData was already updated by the socket callback.
+    // Do not force a second full rebuild here.
+    simData = data;
+    await _saveUiShellState();
+await _saveFlightRuntimeSnapshot();
   }
 
   /// Rotate map smoothly based on heading
   void _animateRotation(double newHeading) {
-    final old = _previousHeading;
-    final target = -newHeading % 360;
+    final target = -((newHeading % 360 + 360) % 360);
 
-    _rotationAnimation = Tween<double>(begin: old, end: target).animate(
-      CurvedAnimation(parent: _rotationController, curve: Curves.easeInOut),
+    double shortestDiff(double from, double to) {
+      double diff = (to - from) % 360;
+
+      if (diff > 180) diff -= 360;
+      if (diff < -180) diff += 360;
+
+      return diff;
+    }
+
+    final diff = shortestDiff(_previousHeading, target);
+
+    // Ignore tiny heading jitter
+    if (diff.abs() < 1.0) return;
+
+    _rotationAnimation = Tween<double>(
+      begin: _previousHeading,
+      end: _previousHeading + diff,
+    ).animate(
+      CurvedAnimation(parent: _rotationController, curve: Curves.easeOut),
     );
 
-    _previousHeading = target;
+    _previousHeading = _previousHeading + diff;
     _rotationController.forward(from: 0);
   }
 
   @override
   void dispose() {
+     _saveUiShellState();
+  _saveFlightRuntimeSnapshot();
     _reconnectTimer?.cancel();
     _socketService.dispose();
     _heartbeatTimer?.cancel();
@@ -858,6 +1259,20 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     _fadeController.dispose();
     _engineVibrate.dispose();
     _powerFlickerCtrl.dispose();
+    _groundLabelMarkersNotifier.dispose();
+    _airportMarkersNotifier.dispose();
+    _airwayPolylinesNotifier.dispose();
+    _airwayLabelsNotifier.dispose();
+    _parkingMarkersNotifier.dispose();
+    _vorMarkersNotifier.dispose();
+    _ndbMarkersNotifier.dispose();
+    _waypointMarkersNotifier.dispose();
+    _fadeController.addListener(_refreshLiveMapVisuals);
+    _cinematicHudTimer?.cancel();
+    _hudFxController.dispose();
+    _parkingUpdateThrottle?.cancel();
+    _aircraftSpinController.dispose();
+    CockpitVibration.dispose();
     super.dispose();
   }
 
@@ -946,9 +1361,8 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   // VORs
   List<Vor> _vors = [];
-  List<Marker> _vorMarkers = [];
   // Filter
-  final bool _showVOR = true;
+  bool _showVOR = true;
   final Map<String, List<Vor>> _vorClusters = {};
   Timer? _vorUpdateThrottle;
   double? _lastVorZoom;
@@ -956,7 +1370,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   // NDBs
   List<Ndb> _ndbs = [];
-  List<Marker> _ndbMarkers = [];
   final Map<String, List<Ndb>> _ndbClusters = {};
 
   Timer? _ndbUpdateThrottle;
@@ -973,22 +1386,19 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   List<Polyline> _runwayPolylines = [];
   List<Runway> _runways = [];
-  final bool _showRunways = true; // toggle via UI
+  bool _showRunways = true; // toggle via UI
   List<Marker> _runwayMarkers = [];
 
   // =============== PARKING STATE ===============
 
   List<ParkingSpot> _parkings = [];
-  List<Marker> _parkingMarkers = [];
-  final Map<String, List<ParkingSpot>> _parkingClusters = {};
   Timer? _parkingUpdateThrottle;
   double? _lastParkingZoom;
   LatLngBounds? _lastParkingBounds;
-  final bool _showParking = true;
+  bool _showParking = true;
 
   // =============== WAYPOINT STATE ===============
   List<Waypoint> _waypoints = [];
-  List<Marker> _waypointMarkers = [];
 
   Timer? _waypointThrottle;
   double _lastWaypointZoom = -1;
@@ -1007,8 +1417,20 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   List<ParkingSpot> _parkingSpots = [];
 
+  // =============== TAXIWAY STATE ===============
+  List<TaxiwaySegment> _groundSegments = [];
+  List<Polyline> _groundPolylines = [];
+  bool _showGround = true;
+  List<TaxiwayLabel> _groundLabels = [];
+  final ValueNotifier<List<Marker>> _groundLabelMarkersNotifier =
+      ValueNotifier<List<Marker>>([]);
+
+  LatLng? _lastGroundQueryPoint;
+  DateTime? _lastGroundQueryTime;
+  bool _loadingGround = false;
+
   bool _filterBig = true;
-  bool _filterHeli = true;
+  bool _filterHeli = false;
 
   LatLng? get currentLatLng =>
       simData != null ? LatLng(simData!.latitude, simData!.longitude) : null;
@@ -1020,9 +1442,18 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   DateTime? _runwayExitCandidate;
 
   GroundPhase? _lastAnnouncedPhase;
-
   bool _runwayPhaseLatched = false;
 
+  GroundPhase? _livePhase;
+  GroundPhase? _pendingPhase;
+  DateTime? _pendingPhaseSince;
+  DateTime? _lastLandedEventTime;
+  bool _finalParkedAnnounced = false;
+  double? _butterScore;
+  double? _takeoffScore;
+  double? _lastTouchdownVs;
+  double? _lastTakeoffPitch;
+  bool _hardLanding = false;
   double? _lastYawRate;
   double? _lastSlipBeta;
   double? _lastRudder;
@@ -1040,6 +1471,11 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   double? _lastHeadingForRunway;
   DateTime? _headingStableSince;
 
+  List<FlightLog> _flightLogs = [];
+  bool _showAllFlights = false;
+  bool _loadingFlightLogs = false;
+  String? _flightLogsUserId;
+  final bool _showGroundLabels = true;
   double get effectiveBusVolts {
     final s = simData;
     if (s == null) return 0;
@@ -1119,6 +1555,57 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
         title.contains("uh60");
   }
 
+  Future<void> _pushJobPhase(String phase) async {
+    final jobId = widget.jobId;
+    if (jobId == null || jobId.isEmpty) return;
+
+    final user = context.read<UserProvider>().user;
+    if (user == null) return;
+
+    if (_lastPushedJobPhase == phase) return;
+    if (!_canTransitionToJobPhase(phase)) return;
+
+    final now = DateTime.now();
+    if (_lastPhasePushTime != null &&
+        now.difference(_lastPhasePushTime!).inMilliseconds < 1200) {
+      return;
+    }
+
+    try {
+      final updated = await DispatchService.updatePhase(jobId, user.id, phase);
+
+      if (updated != null) {
+        _lastPushedJobPhase = updated.phase;
+        _lastPhasePushTime = now;
+        debugPrint('✅ Job phase → ${updated.phase}');
+      }
+    } catch (e) {
+      debugPrint('❌ Phase update failed: $e');
+    }
+  }
+
+  bool _canTransitionToJobPhase(String next) {
+    const order = [
+      'open',
+      'accepted',
+      'preparing',
+      'loading',
+      'ready',
+      'enroute',
+      'arrived',
+      'unloading',
+    ];
+
+    final current = _lastPushedJobPhase ?? 'accepted';
+
+    final currentIndex = order.indexOf(current);
+    final nextIndex = order.indexOf(next);
+
+    if (currentIndex == -1 || nextIndex == -1) return false;
+
+    return nextIndex > currentIndex;
+  }
+
   /// Main UI
   @override
   Widget build(BuildContext context) {
@@ -1136,11 +1623,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     bool isMobile(BuildContext context) {
       final width = MediaQuery.of(context).size.width;
       return width < 600; // 👈 threshold for mobile
-    }
-
-    bool isTablet(BuildContext context) {
-      final width = MediaQuery.of(context).size.width;
-      return width >= 600 && width < 1024;
     }
 
     bool isDesktop(BuildContext context) {
@@ -1173,242 +1655,308 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
           return normalized * (pi / 180);
         })();
 
+    final deepZoomMode = context.watch<DeepZoomProvider>().mode;
+    final useCleanBackgroundAfterNativeZoom =
+        deepZoomMode == DeepZoomMode.cleanBackground;
+
+    final shouldShowTileLayer =
+        _currentZoom <= _lastRealTileZoom || !useCleanBackgroundAfterNativeZoom;
+
+    final shouldShowDeepZoomGrid =
+        _currentZoom > _lastRealTileZoom && useCleanBackgroundAfterNativeZoom;
+
     return Stack(
       children: [
         // ===========================================================
-        // 1. AVATAR MODE → Show GroundOpsScreen INSTEAD of the map
+        // 1. AVATAR MODE → Show GroundOpsScreen INSTEAD of the map _shouldShowGroundOps
         // ===========================================================
-        if (simData != null && simData!.isAvatar)
-          Positioned.fill(child: GroundOpsScreen(flight: _currentFlight)),
-
+        if (_shouldShowGroundOps)
+          Positioned.fill(
+            child: GroundOpsScreen(
+              flight: _currentFlight,
+              minimalView: _groundOpsMinimalView,
+              onClose: () {
+                setState(() => _showGroundOpsManually = false);
+              },
+            ),
+          ),
         // ===========================================================
         // 2. AIRCRAFT MODE → Show the MapScreen as you already built it
         // ===========================================================
-        if (simData == null || (simData!.isAircraft && !simData!.isAvatar)) ...[
+        if (!_shouldShowGroundOps) ...[
           // 🔥 Put ALL your existing Map UI here.
           // Nothing changes, you keep 100% of your current code.
-          FlutterMap(
-            mapController: mapController,
-            options: MapOptions(
-              onPositionChanged: (camera, hasGesture) {
-                _mapCenter = camera.center;
-                _currentZoom = camera.zoom;
-              },
-              onMapReady: () {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (!mounted) return;
-                  setState(() => _mapReady = true);
-                  _throttledUpdateAirportMarkers(); // Ensure initial markers load
-                });
-              },
-              initialCenter: initialView,
-              initialZoom: 7,
-              interactionOptions: const InteractionOptions(
-                flags: InteractiveFlag.all,
-              ),
-            ),
+          Listener(
+            onPointerDown: (_) {
+              _touchReleaseTimer?.cancel();
+              _userTouchingMap = true;
+            },
+            onPointerUp: (_) {
+              _touchReleaseTimer?.cancel();
+              _touchReleaseTimer = Timer(const Duration(milliseconds: 350), () {
+                _userTouchingMap = false;
+              });
+            },
+            onPointerCancel: (_) {
+              _touchReleaseTimer?.cancel();
+              _userTouchingMap = false;
+            },
+            child: FlutterMap(
+              mapController: mapController,
+              options: MapOptions(
+                initialCenter: _initialCenter ?? initialView,
+                initialZoom: 2,
+                minZoom: 1,
+                maxZoom: 20,
+                backgroundColor: tileLayers[_mapStyleIndex].mapBackgroundColor,
+                onPositionChanged: (camera, hasGesture) {
+                  _mapCenter = camera.center;
+                  _currentZoom = camera.zoom;
 
-            children: [
-              // Map tile layer
-              TileLayer(
-                retinaMode: false,
-                urlTemplate: tileLayers[_mapStyleIndex].url,
-                subdomains: tileLayers[_mapStyleIndex].subdomains,
-                userAgentPackageName: 'com.skycase',
-              ),
-
-              // ✅ Water zones appear after a route is picked
-              if (_plannedEnd != null)
-                CircleLayer(
-                  circles: [
-                    CircleMarker(
-                      point: _plannedEnd!,
-                      radius: 5000, // ~5km, adjust as needed
-                      useRadiusInMeter: true,
-                      color: Colors.blue.withOpacity(0.2),
-                      borderStrokeWidth: 2,
-                      borderColor: Colors.blueAccent,
-                    ),
-                  ],
-                ),
-
-              // Aircraft trail polyline
-              if (_trail.length > 1)
-                PolylineLayer(
-                  polylines: [
-                    Polyline(
-                      points: _trail,
-                      strokeWidth: 4.0,
-                      color: _getTrailColor(simData?.altitude ?? 0),
-                    ),
-                  ],
-                ),
-
-              if (_currentFlight != null) ...[
-                PolylineLayer(
-                  polylines:
-                      _isDirectRoute()
-                          ? (() {
-                            final originIcao = _currentFlight!.originIcao;
-                            final destIcao = _currentFlight!.destinationIcao;
-
-                            final origin =
-                                originIcao == 'LIVEPOS'
-                                    ? LatLng(
-                                      _currentFlight!.originLat!,
-                                      _currentFlight!.originLng!,
-                                    )
-                                    : _airportCoords[originIcao];
-
-                            final destination = _airportCoords[destIcao];
-
-                            // ❌ Do NOT render polyline unless BOTH points exist
-                            if (origin == null || destination == null) {
-                              return <Polyline>[];
-                            }
-
-                            return [
-                              Polyline(
-                                points: [origin, destination],
-                                strokeWidth: 5,
-                                color: const Color.fromARGB(255, 83, 64, 255),
-                              ),
-                            ];
-                          })()
-                          : [
-                            Polyline(
-                              points: _buildCustomRoute(),
-                              strokeWidth: 4,
-                              color: Colors.cyanAccent,
-                            ),
-                          ],
-                ),
-              ],
-
-              AnimatedBuilder(
-                animation: _fadeAnimation,
-                builder: (context, _) {
-                  if (_aircraftLatLng == null || _headingBugTarget == null) {
-                    return const SizedBox();
+                  if (_showGround && _showGroundLabels) {
+                    final zoom = camera.zoom;
+                    if ((_lastZoom == null) ||
+                        ((zoom - (_lastZoom ?? zoom)).abs() >= 0.2)) {
+                      _groundLabelMarkersNotifier
+                          .value = _buildGroundLabelMarkers(_groundLabels);
+                      _lastZoom = zoom;
+                    }
                   }
 
-                  final dots = buildDottedLine(
-                    _aircraftLatLng!,
-                    _headingBugTarget!,
-                    dotSpacingMeters: 350, // tune this
-                  );
-
-                  return PolylineLayer(
-                    polylines: [
-                      for (int i = 0; i < dots.length - 1; i += 2)
-                        Polyline(
-                          points: [dots[i], dots[i + 1]],
-                          color: Colors.cyanAccent.withOpacity(
-                            _fadeAnimation.value,
-                          ),
-                          strokeWidth: 2.5,
-                        ),
-                    ],
-                  );
+                  if (mounted) {
+                    setState(() {});
+                  }
                 },
+                onMapReady: () {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (!mounted) return;
+
+                    _mapCenter = mapController.camera.center;
+                    _currentZoom = mapController.camera.zoom;
+
+                    setState(() => _mapReady = true);
+                    _throttledUpdateAirportMarkers();
+
+                    _groundOverlayThrottle?.cancel();
+                    _groundOverlayThrottle = Timer(
+                      const Duration(milliseconds: 1000),
+                      () {
+                        _updateGroundOverlayFromMapCenter();
+                        _throttledUpdateParkingMarkers(force: true);
+                        _throttledUpdateVorMarkers(force: true);
+                        _throttledUpdateNdbMarkers(force: true);
+                        _throttledUpdateWaypointMarkers(force: true);
+                      },
+                    );
+                  });
+                },
+                interactionOptions: const InteractionOptions(
+                  flags: InteractiveFlag.all,
+                  rotationThreshold: 15.0,
+                ),
               ),
+              children: [
+                // Map tile layer
+                if (shouldShowTileLayer)
+                  TileLayer(
+                    urlTemplate: tileLayers[_mapStyleIndex].url,
+                    subdomains: tileLayers[_mapStyleIndex].subdomains,
+                    userAgentPackageName: 'com.skycase',
+                    retinaMode: false,
+                    tileDimension: 256,
+                    minZoom: 1,
+                    maxZoom: 20,
+                    maxNativeZoom: _lastRealTileZoom.toInt(),
+                    keepBuffer: 0,
+                    panBuffer: 0,
+                  ),
 
-              if (_showRunways) PolylineLayer(polylines: _runwayPolylines),
-              if (_showRunways) MarkerLayer(markers: _runwayMarkers),
+                if (shouldShowDeepZoomGrid)
+                  DeepZoomGridLayer(
+                    zoom: _currentZoom,
+                    gridColor: tileLayers[_mapStyleIndex].fallbackGridColor,
+                    crossColor: tileLayers[_mapStyleIndex].fallbackCrossColor,
+                    startZoom: _lastRealTileZoom + 0.2,
+                  ),
 
-              if (_showVOR) MarkerLayer(markers: _vorMarkers),
+                // Aircraft trail polyline
+                ValueListenableBuilder<LiveMapVisuals>(
+                  valueListenable: _liveMapVisualsNotifier,
+                  builder: (_, visuals, __) {
+                    if (visuals.trailPolylines.isEmpty) {
+                      return const SizedBox.shrink();
+                    }
+                    return PolylineLayer(polylines: visuals.trailPolylines);
+                  },
+                ),
 
-              if (_showNDB) MarkerLayer(markers: _ndbMarkers),
-              if (_showParking) MarkerLayer(markers: _parkingMarkers),
-              if (_showWaypoints) MarkerLayer(markers: _waypointMarkers),
+                if (_showGround && _groundPolylines.isNotEmpty)
+                  PolylineLayer(polylines: _groundPolylines),
 
-              // 💣 Fully skip marker layer below zoom 3.0
-              if (_mapReady && mapController.camera.zoom >= 3.0)
-                MarkerLayer(markers: _buildVisibleAirportMarkers()),
+                if (_showGround && _showGroundLabels)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _groundLabelMarkersNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
 
-              // Aircraft + trail start/end markers including turbulence markers
-              MarkerLayer(
-                markers: [
-                  // ✈️ Aircraft marker (only when data is available)
-                  if (simData != null)
-                    Marker(
-                      width: 40,
-                      height: 40,
-                      point: LatLng(simData!.latitude, simData!.longitude),
-                      child: Transform.rotate(
-                        angle: rotationAngle,
-                        child: Icon(
-                          isHelicopter
-                              ? Icons
-                                  .flight // temporary heli-friendly icon
-                              : Icons.airplanemode_active,
-                          size: 40,
-                          color: _getMarkerColor(
-                            tileLayers[_mapStyleIndex].name,
+                if (_showAllFlights && _flightLogs.isNotEmpty)
+                  PolylineLayer(polylines: _buildFlightHistoryPolylines()),
+
+                if (_currentFlight != null &&
+                    _buildDisplayedRoute().length >= 2) ...[
+                  Builder(
+                    builder: (_) {
+                      final routePoints = _buildDisplayedRoute();
+
+                      if (routePoints.length < 2) {
+                        return const SizedBox.shrink();
+                      }
+
+                      return PolylineLayer(
+                        polylines: [
+                          Polyline(
+                            points: routePoints,
+                            strokeWidth: 5,
+                            color: Colors.cyanAccent,
                           ),
-                        ),
-                      ),
-                    ),
-
-                  // 🏠 Home Base marker (always visible if available)
-                  if (_homeBase != null)
-                    Marker(
-                      point: _homeBase!,
-                      width: 30,
-                      height: 30,
-                      child: IgnorePointer(
-                        ignoring: true, // <-- TAP-THROUGH FIX
-                        child: Tooltip(
-                          message: 'Home Base',
-                          child: Icon(
-                            Icons.home,
-                            color: Colors.blueAccent,
-                            size: 28,
-                            shadows: [
-                              Shadow(blurRadius: 5, color: Colors.black45),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-
-                  // 🏁 Last Flight Destination marker
-                  if (_lastFlightDestination != null)
-                    Marker(
-                      point: _lastFlightDestination!,
-                      width: 30,
-                      height: 30,
-                      child: Tooltip(
-                        message: 'Last Flight Destination',
-                        child: Icon(
-                          Icons.airplane_ticket,
-                          color: Colors.lightGreenAccent,
-                          size: 28,
-                          shadows: [
-                            Shadow(blurRadius: 5, color: Colors.black45),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                  // 🌪️ Turbulence events
-                  ..._turbulenceEvents.map(
-                    (event) => Marker(
-                      width: 16,
-                      height: 16,
-                      point: event.location,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: _getTurbulenceColor(event.severity),
-                          border: Border.all(color: Colors.redAccent, width: 2),
-                        ),
-                      ),
-                    ),
+                        ],
+                      );
+                    },
                   ),
                 ],
-              ),
-            ],
+                ValueListenableBuilder<LiveMapVisuals>(
+                  valueListenable: _liveMapVisualsNotifier,
+                  builder: (_, visuals, __) {
+                    if (visuals.headingBugPolylines.isEmpty)
+                      return const SizedBox.shrink();
+                    return PolylineLayer(
+                      polylines: visuals.headingBugPolylines,
+                    );
+                  },
+                ),
+
+                if (_showRunways) PolylineLayer(polylines: _runwayPolylines),
+                if (_showRunways) MarkerLayer(markers: _runwayMarkers),
+
+                if (_showVOR)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _vorMarkersNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
+
+                if (_showNDB)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _ndbMarkersNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
+                if (_showParking)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _parkingMarkersNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
+                if (_showWaypoints)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _waypointMarkersNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
+                if (_showAirways)
+                  ValueListenableBuilder<List<Polyline>>(
+                    valueListenable: _airwayPolylinesNotifier,
+                    builder: (_, polylines, __) {
+                      if (polylines.isEmpty) return const SizedBox.shrink();
+                      return PolylineLayer(polylines: polylines);
+                    },
+                  ),
+                if (_showAirways)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _airwayLabelsNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
+                // 💣 Fully skip marker layer below zoom 3.0
+                if (_mapReady && mapController.camera.zoom >= 2.0)
+                  ValueListenableBuilder<List<Marker>>(
+                    valueListenable: _airportMarkersNotifier,
+                    builder: (_, markers, __) {
+                      if (markers.isEmpty) return const SizedBox.shrink();
+                      return MarkerLayer(markers: markers);
+                    },
+                  ),
+
+                // Aircraft + trail start/end markers including turbulence markers
+                ValueListenableBuilder<LiveMapVisuals>(
+                  valueListenable: _liveMapVisualsNotifier,
+                  builder: (_, visuals, __) {
+                    final markers = <Marker>[
+                      ...visuals.markers,
+
+                      if (_showPoi)
+                        ...visiblePoiForZoom(_currentZoom).map((poi) {
+                          return Marker(
+                            point: LatLng(poi.lat, poi.lng),
+                            width: 96,
+                            height: 56,
+                            child: GestureDetector(
+                              onTap: () => _showPoiInfo(poi),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    poiIconForType(poi.type),
+                                    size: 18,
+                                    color: poiColorForType(poi.type),
+                                  ),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 4,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withOpacity(0.55),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Text(
+                                      poi.name,
+                                      textAlign: TextAlign.center,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 9,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        }),
+                    ];
+
+                    if (markers.isEmpty) return const SizedBox.shrink();
+                    return MarkerLayer(markers: markers);
+                  },
+                ),
+              ],
+            ),
           ),
 
           // ======================================
@@ -1540,28 +2088,11 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
               ),
             ),
 
-          // Map style selector (top right)
-          if (battOn || isDataOffline)
-            Positioned(
-              top: 50,
-              right: 12,
-              child: MapTileSelector(
-                selectedIndex: _mapStyleIndex,
-                tileOptions: tileLayers,
-                onSelected: (index) async {
-                  setState(() => _mapStyleIndex = index);
-                  final prefs = await SharedPreferences.getInstance();
-                  prefs.setInt(_mapStyleKey, index);
-                },
-                iconColor: _getMapStyleIconColor(),
-              ),
-            ),
-
           // Live data overlay
           if (hasData)
             MapOverlay(
               simData: simData!,
-              show: ((powerOn || isDataOffline) && !simData!.onGround),
+              show: (powerOn || isDataOffline),
               vibrate: _vibrateIfEngineOn,
             ),
 
@@ -1578,6 +2109,12 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
                   setState(() => _followAircraft = !_followAircraft);
 
                   if (_followAircraft && simData != null) {
+                    final aircraftPos = LatLng(
+                      simData!.latitude,
+                      simData!.longitude,
+                    );
+
+                    mapController.move(aircraftPos, mapController.camera.zoom);
                     _animateRotation(simData!.heading);
                   }
                 },
@@ -1606,6 +2143,31 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
               ),
             ),
 
+          if (_isConnected && hasData && _settingsLoaded && battOn)
+            Positioned(
+              top: 50,
+              right: 100,
+              child: FloatingActionButton.small(
+                heroTag: 'ground_ops_btn',
+                onPressed: () {
+                  setState(() => _showGroundOpsManually = true);
+                },
+                child: const Icon(Icons.flight_class),
+              ),
+            ),
+
+          if ((battOn || isDataOffline) && _settingsLoaded)
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 800), // Διάρκεια κίνησης
+              curve: Curves.easeInOut, // Ομαλή κίνηση
+              top: 50,
+              right: (simData != null) ? 20 : 16,
+              child: FloatingActionButton.small(
+                heroTag: 'map_side_menu_btn',
+                onPressed: _toggleSideMenu,
+                child: const Icon(Icons.menu),
+              ),
+            ),
           if (_isConnected && hasData && _settingsLoaded && !_autoFlightEnabled)
             Positioned(
               bottom: isDesktop(context) ? 20 : 80,
@@ -1632,48 +2194,40 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
               ),
             ),
 
-          if (battOn || isDataOffline)
-            Positioned(
-              top: 50,
-              left:
-                  !hasData
-                      ? 10
-                      : _isConnected
-                      ? 130
-                      : 20,
-              child: FloatingActionButton.small(
-                heroTag: 'home_button',
-                onPressed: () {
-                  if (!mounted) return;
-
-                  Navigator.pop(context);
-                },
-                child: const Icon(Icons.home_outlined),
-              ),
-            ),
-
-          if (isDataOffline)
-            Positioned(
-              bottom: isMobile(context) ? 30 : 35,
-              left: isMobile(context) ? 10 : 40,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 10,
-                ),
-                decoration: offlineBadgeDecoration(context),
-                child: const Text(
-                  'SimLink offline\nAircraft telemetry unavailable\nDirect distance & ETA tools still available',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    height: 1.25,
-                    letterSpacing: 0.3,
-                  ),
+          Positioned(
+            bottom: 10,
+            left: isMobile(context) ? 10 : 40,
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeInOut,
+              opacity: isDataOffline ? 1 : 0,
+              child: IgnorePointer(
+                ignoring: !isDataOffline,
+                child: const Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.power_settings_new,
+                      color: Colors.white,
+                      size: 26,
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      'SimLink offline',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        height: 1.25,
+                        letterSpacing: 0.3,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
+          ),
 
           // 📶 Connect/Disconnect Button
           if (!_autoConnectEnabled)
@@ -1806,63 +2360,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
                       ),
             ),
 
-          if (_currentFlight != null && !isDataOffline && (powerOn || battOn))
-            Positioned(
-              top:
-                  isDesktop(context)
-                      ? 100
-                      : isTablet(context)
-                      ? 120
-                      : 100,
-              left: isDesktop(context) ? 10 : 10,
-
-              child: Align(
-                alignment: Alignment.topCenter,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.black.withOpacity(0.7),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 10,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                  icon: const Icon(
-                    Icons.assignment_outlined,
-                    color: Colors.orangeAccent,
-                  ),
-                  label: const Text("Flight Plan Details"),
-                  onPressed: () => _showFlightDialog(context),
-                ),
-              ),
-            ),
-
-          if (_currentFlight != null &&
-              !isDataOffline &&
-              (powerOn || battOn) &&
-              _inFlight)
-            Positioned(
-              top: 150,
-              left: 10,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.6),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  '🟠 ${_currentFlight!.destinationIcao}  |  ${_remainingNm.toStringAsFixed(1)} NM',
-                  style: const TextStyle(color: Colors.white, fontSize: 16),
-                ),
-              ),
-            ),
-
           // 🛩️ AUTOPILOT STATUS PANEL
           if (simData != null && (powerOn || isDataOffline))
             Positioned(
@@ -1873,43 +2370,16 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
               ),
             ),
 
-          if (_currentFlight != null && _inFlight && battOn && !batteryOnly)
-            Positioned(
-              bottom: _inFlight ? 250 : 220,
-              left: 5,
-              child: _etaHud(),
-            ),
-
           // SYSTEM LIGHT STRIP (under the top buttons)
-          if (simData != null && (battOn || isDataOffline))
+          if (simData != null && (powerOn || battOn))
             Positioned(
-              bottom:
-                  _inFlight
-                      ? (isDesktop(context) ? 130 : 100) // 👈 lower when flying
-                      : (isDesktop(context)
-                          ? 180
-                          : 100), // 👈 original positions
+              bottom: isDesktop(context) ? 130 : 100,
               left: 12,
               right: 12,
               child: powerDim(
                 _vibrateIfEngineOn(
                   _systemStrip(simData!.mission, isDesktop(context)),
                 ),
-              ),
-            ),
-
-          // ⭐ METAR FAB — only when SimLink is connected
-          if (_isConnected && hasData && (powerOn || isDataOffline))
-            Positioned(
-              top: 50,
-              left: 185,
-              child: FloatingActionButton.small(
-                heroTag: 'metar_toggle',
-                onPressed: () {
-                  if (!mounted) return;
-                  setState(() => _showMetar = !_showMetar);
-                },
-                child: const Icon(Icons.info_outline),
               ),
             ),
 
@@ -1923,42 +2393,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
               left: 10,
               right: 10,
               child: _buildMetarPanel(simData!.weather),
-            ),
-
-          FutureBuilder<bool>(
-            future: NavigraphPrefs.getHasPremium(),
-            builder: (context, snapshot) {
-              final hasPremium = snapshot.data ?? false;
-
-              if (!hasPremium) return SizedBox.shrink();
-              if (Platform.isWindows) return SizedBox.shrink();
-
-              // ⛔ NEW: Hide completely if battery OFF
-              if (!battOn || !isDataOffline) return SizedBox.shrink();
-
-              return Positioned(
-                top: 50,
-                left: !hasData ? 70 : 230,
-                child: FloatingActionButton.small(
-                  heroTag: 'navigraph_btn',
-                  backgroundColor: Colors.blueGrey,
-                  elevation: 6,
-                  child: const Icon(Icons.map_outlined, size: 20),
-                  onPressed: () => _openNavigraphSheet(context),
-                ),
-              );
-            },
-          ),
-
-          if (battOn || isDataOffline)
-            Positioned(
-              top: 50,
-              right: 50,
-              child: FloatingActionButton.small(
-                heroTag: 'icao_search_btn',
-                onPressed: () => _openIcaoSearchDialog(),
-                child: Icon(Icons.search),
-              ),
             ),
 
           if (_gearFlapsMessage != null)
@@ -2042,63 +2476,10 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
               ),
             ),
 
-          if (hasData)
-            Positioned(
-              bottom: isMobile(context) ? 220 : 300,
-              left: 12,
-              child: powerDim(
-                _vibrateIfEngineOn(
-                  Opacity(
-                    opacity:
-                        battOn
-                            ? 1
-                            : 0.35, // optional: dim more when battery off
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.55),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(
-                          color: Colors.white.withOpacity(0.25),
-                          width: 0.8,
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          Text(
-                            "BUS ${simData!.mainBusVolts.toStringAsFixed(1)}V",
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Text(
-                            "OAT ${simData!.weather.temperature.toStringAsFixed(0)}°C",
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
           if (hasData && isIcing(simData!))
             Positioned(
-              top: 50,
-              left: 12,
+              bottom: 250,
+              left: 10,
               child: powerDim(
                 _vibrateIfEngineOn(
                   Container(
@@ -2121,22 +2502,11 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
                 ),
               ),
             ),
-          if (battOn || isDataOffline)
-            Positioned(
-              top:
-                  isMobile(context)
-                      ? _currentFlight == null
-                          ? 100
-                          : 110
-                      : 160,
-              left: 10,
-              child: _buildFilterButton(context),
-            ),
 
-          if ((battOn || isDataOffline) && _mapCenter != null)
+          if ((battOn || isDataOffline) && _mapCenter != null && !_showMetar)
             Positioned(
-              top: 100,
-              right: 25,
+              bottom: 10,
+              right: 20,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 decoration: BoxDecoration(
@@ -2144,37 +2514,83 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
                   borderRadius: BorderRadius.circular(6),
                 ),
                 child: Text(
-                  "${_zoomToNm(_currentZoom, _mapCenter!.latitude).toStringAsFixed(1)} NM",
+                  "ZOOM ${_currentZoom.toStringAsFixed(1)}",
                   style: const TextStyle(
-                    fontSize: 11,
-                    color: Colors.white70,
-                    fontWeight: FontWeight.w500,
+                    fontSize: 10,
+                    color: Colors.white60,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.5,
                   ),
                 ),
               ),
             ),
-          if (simData != null && simData!.mainBusVolts > 0)
-            Positioned(
-              bottom: isMobile(context) ? 260 : 270,
-              left: 12,
-              child: _radioHud(simData!),
-            ),
         ],
+
+        if (_showSideMenu) ...[
+          Positioned.fill(
+            child: GestureDetector(
+              onTap: _toggleSideMenu,
+              child: Container(color: Colors.black.withOpacity(0.25)),
+            ),
+          ),
+          _buildMapSideMenu(context),
+        ],
+
+        if (_currentFlight != null &&
+            !isDataOffline &&
+            (powerOn || battOn) &&
+            !_showMetar &&
+            !_showGroundOpsManually)
+          Positioned(
+            top: isDesktop(context) ? 20 : 100,
+            left: 0,
+            right: 0,
+            child: Center(child: _flightPlanPanel(context)),
+          ),
+
+        if (_currentFlight != null &&
+            !isDataOffline &&
+            (powerOn || battOn) &&
+            !_showMetar &&
+            !_showGroundOpsManually &&
+            simData != null)
+          Positioned(
+            bottom: isDesktop(context) ? 250 : 220, // 👈 adjust if needed
+            left: 10,
+
+            child: _busOatPanel(),
+          ),
+        if (_selectedMapObject != null)
+          Positioned(
+            left: _infoCardLeft,
+            top: _infoCardTop,
+            child: _buildDraggableSelectedObjectCard(context),
+          ),
+
+        if (simData != null && (powerOn || isDataOffline))
+          Positioned(
+            bottom: isDesktop(context) ? 130 : 100, // 👈 adjust if needed
+            left: 180,
+            child: _comRadioOverlay(simData!),
+          ),
+
+        if (_nearbyPoiAlert != null &&
+            _selectedMapObject == null &&
+            (powerOn || isDataOffline))
+          Positioned(top: 150, right: 16, child: _buildNearbyPoiAlertCard()),
+
+        if (_cinematicHudMessage != null) _buildCinematicHud(),
       ],
     );
   }
 
-  List<Marker> _buildVisibleAirportMarkers() => _airportMarkers;
-
   /// Aircraft marker color based on map style
   Color _getMarkerColor(String tileName) {
     switch (tileName.toLowerCase()) {
-      case 'black':
+      case 'skycase dark':
         return Colors.white;
-      case 'white':
+      case 'skycase light':
         return Colors.black;
-      case 'topomap':
-        return const Color.fromARGB(255, 64, 127, 243);
       default:
         return const Color.fromARGB(255, 3, 131, 206);
     }
@@ -2185,16 +2601,11 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     final base = _altitudeTint(altitude);
 
     switch (themeName) {
-      case 'black': // NAVBLUE / DARK
+      case 'skycase dark':
         return _mix(base, Colors.cyanAccent, 0.40);
-
-      case 'white': // LIGHT MODE
+      case 'skycase light':
         return _mix(base, Colors.orangeAccent, 0.25);
-
-      case 'topomap':
-        return _mix(base, Colors.indigo, 0.30);
-
-      default: // fallback
+      default:
         return _mix(base, Colors.deepPurpleAccent, 0.25);
     }
   }
@@ -2204,11 +2615,37 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       case 'severe':
         return Colors.red.withOpacity(0.5);
       case 'moderate':
-        return Colors.orange.withOpacity(0.5);
-      case 'light':
       default:
         return Colors.yellow.withOpacity(0.4);
     }
+  }
+
+  List<Poi> visiblePoiForZoom(double zoom) {
+    if (zoom < 3.5) {
+      return globalPoi
+          .where(
+            (p) =>
+                p.name == 'Pyramids of Giza' ||
+                p.name == 'Mount Everest' ||
+                p.name == 'Great Wall of China' ||
+                p.name == 'Grand Canyon' ||
+                p.name == 'Machu Picchu' ||
+                p.name == 'Uluru' ||
+                p.name == 'Bermuda Triangle' ||
+                p.name == 'Point Nemo' ||
+                p.name == 'Acropolis' ||
+                p.name == 'Eiffel Tower',
+          )
+          .toList();
+    }
+
+    if (zoom < 5.5) {
+      return globalPoi
+          .where((p) => p.type != 'historic' || p.name.length < 18)
+          .toList();
+    }
+
+    return globalPoi;
   }
 
   Future<void> _loadAirports() async {
@@ -2225,358 +2662,348 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     });
   }
 
-  void _showAirportInfo(Airport airport) async {
-    final wx = await WeatherEngineService.getAirportWeather(airport);
-
-    if (!mounted) return;
-
-    final cat = wx["category"] ?? "UNKNOWN";
-
-    final catColor =
-        {
-          "VFR": Colors.greenAccent,
-          "MVFR": Colors.blueAccent,
-          "IFR": Colors.redAccent,
-          "LIFR": Colors.purpleAccent,
-        }[cat] ??
-        Colors.grey;
-
-    final source = wx["source"] ?? "UNKNOWN";
-
-    final sourceColor =
-        {
-          "REAL": Colors.cyanAccent,
-          "SIMLINK": Colors.orangeAccent,
-          "REGIONAL": Colors.lightGreenAccent,
-          "MODEL": Colors.pinkAccent,
-        }[source] ??
-        Colors.white70;
-
-    IconData icon = Icons.wb_sunny;
-    final raw = wx["raw"]?.toString() ?? "";
-
-    if (raw.contains("TS")) {
-      icon = Icons.flash_on;
-    } else if (raw.contains("RA") || raw.contains("DZ")) {
-      icon = Icons.water_drop;
-    } else if (raw.contains("SN")) {
-      icon = Icons.ac_unit;
-    } else if (raw.contains("FG") || raw.contains("BR")) {
-      icon = Icons.cloud;
-    } else if (raw.contains("BKN") || raw.contains("OVC")) {
-      icon = Icons.cloud_queue;
-    }
-
-    showModalBottomSheet(
+  void _showAirportInfo(Airport airport) {
+    showGeneralDialog(
       context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.black87,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
-      ),
-      builder: (_) {
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 30),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // ============================================================
-                // HEADER ROW
-                // ============================================================
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    // CATEGORY RING
-                    Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(color: catColor, width: 3),
-                      ),
-                      child: Center(
-                        child: Icon(icon, color: catColor, size: 20),
-                      ),
-                    ),
-                    const SizedBox(width: 14),
+      barrierLabel: "Airport Info",
+      barrierDismissible: true,
+      barrierColor: Colors.black54,
+      transitionDuration: const Duration(milliseconds: 260),
+      pageBuilder: (context, animation, secondaryAnimation) {
+        final screenWidth = MediaQuery.of(context).size.width;
+        final isMobile = screenWidth < 700;
+        final double panelWidth = isMobile ? screenWidth * 0.94 : 430;
 
-                    // ICAO + NAME
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            "${airport.icao} – ${airport.name}",
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          Text(
-                            "${airport.country} • Elev ${airport.elevation.toStringAsFixed(0)} ft",
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 13,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-
-                    // RIGHT SIDE: SOURCE + CATEGORY BADGE
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(color: sourceColor, width: 1.2),
-                          ),
-                          child: Text(
-                            source,
-                            style: TextStyle(
-                              color: sourceColor,
-                              fontSize: 12,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        _categoryBadge(wx),
-                      ],
+        return SafeArea(
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                width: panelWidth,
+                height: double.infinity,
+                margin: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.white12),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black54,
+                      blurRadius: 18,
+                      offset: Offset(-4, 0),
                     ),
                   ],
                 ),
-
-                const SizedBox(height: 18),
-                Divider(color: Colors.white24),
-                const SizedBox(height: 12),
-
-                // ============================================================
-                // WEATHER DETAILS GRID
-                // ============================================================
-                _infoRow("Wind", wx["wind"] ?? "N/A"),
-                _infoRow("Temp", "${wx["temp"]}°C"),
-                _infoRow("Visibility", wx["visibility"] ?? "N/A"),
-                _infoRow(
-                  "Clouds",
-                  wx["clouds"] == null || wx["clouds"].isEmpty
-                      ? "Clear"
-                      : wx["clouds"].join(", "),
-                ),
-                _infoRow("Pressure", wx["pressure"] ?? "N/A"),
-
-                const SizedBox(height: 16),
-                Divider(color: Colors.white24),
-                const SizedBox(height: 14),
-
-                // ============================================================
-                // RAW METAR BLOCK
-                // ============================================================
-                const Text(
-                  "Raw METAR",
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.white12),
-                  ),
-                  child: Text(
-                    raw,
-                    style: const TextStyle(
-                      color: Colors.white70,
-                      fontFamily: 'RobotoMono',
-                      fontSize: 13,
-                    ),
-                  ),
-                ),
-
-                const SizedBox(height: 24),
-                // ============================================================
-                // AIRPORT FREQUENCIES
-                // ============================================================
-                Builder(
-                  builder: (_) {
-                    final freqs = _freqByIcao[airport.icao] ?? [];
-
-                    if (freqs.isEmpty) return const SizedBox.shrink();
-
-                    // 🧹 Deduplicate identical freq+type pairs
-                    final unique = <String, AirportFrequency>{};
-                    for (final f in freqs) {
-                      unique["${f.type}_${f.frequency}"] = f;
-                    }
-
-                    final cleanList = unique.values.toList();
-
-                    // Friendly type names
-                    String friendly(String t) {
-                      switch (t) {
-                        case "T":
-                          return "Tower";
-                        case "G":
-                          return "Ground";
-                        case "A":
-                          return "Approach";
-                        case "RDO":
-                          return "Radio";
-                        case "RDR":
-                          return "Radar";
-                        case "DIR":
-                          return "Director";
-                        case "ATIS":
-                          return "ATIS";
-                        case "APT":
-                          return "Airport";
-                        default:
-                          return t;
-                      }
-                    }
-
-                    IconData iconFor(String t) {
-                      switch (t) {
-                        case "T":
-                          return Icons.airplanemode_active;
-                        case "G":
-                          return Icons.local_taxi;
-                        case "A":
-                          return Icons.south_west;
-                        case "RDO":
-                          return Icons.wifi_tethering;
-                        case "RDR":
-                          return Icons.radar;
-                        case "DIR":
-                          return Icons.splitscreen;
-                        case "ATIS":
-                          return Icons.speaker;
-                        default:
-                          return Icons.radio;
-                      }
-                    }
-
-                    Color colorFor(String t) {
-                      switch (t) {
-                        case "T":
-                          return Colors.orangeAccent;
-                        case "G":
-                          return Colors.greenAccent;
-                        case "A":
-                          return Colors.cyanAccent;
-                        case "RDO":
-                          return Colors.purpleAccent;
-                        case "RDR":
-                          return Colors.redAccent;
-                        case "DIR":
-                          return Colors.yellowAccent;
-                        case "ATIS":
-                          return Colors.blueAccent;
-                        default:
-                          return Colors.white70;
-                      }
-                    }
-
-                    return Column(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const SizedBox(height: 22),
-                        Divider(color: Colors.white24),
-                        const SizedBox(height: 16),
-
-                        const Text(
-                          "Frequencies",
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 15,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-
-                        ...cleanList.map((f) {
-                          final mhz = (f.frequency / 1000.0).toStringAsFixed(3);
-
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 6),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  iconFor(f.type),
-                                  size: 18,
-                                  color: colorFor(f.type),
+                        // ============================================================
+                        // HEADER ROW
+                        // ============================================================
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            Container(
+                              width: 38,
+                              height: 38,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: Colors.cyanAccent,
+                                  width: 2.5,
                                 ),
-                                const SizedBox(width: 12),
+                              ),
+                              child: const Center(
+                                child: Icon(
+                                  Icons.local_airport,
+                                  color: Colors.cyanAccent,
+                                  size: 20,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 14),
 
-                                Expanded(
-                                  child: Text(
-                                    friendly(f.type) +
-                                        (f.description != null &&
-                                                f.description!.isNotEmpty
-                                            ? " – ${f.description}"
-                                            : ""),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    "${airport.icao} – ${airport.name}",
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    "${airport.country} • Elev ${airport.elevation.toStringAsFixed(0)} ft",
                                     style: const TextStyle(
                                       color: Colors.white70,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+
+                            const SizedBox(width: 8),
+
+                            InkWell(
+                              onTap: () => Navigator.pop(context),
+                              borderRadius: BorderRadius.circular(8),
+                              child: const Padding(
+                                padding: EdgeInsets.all(4),
+                                child: Icon(
+                                  Icons.close,
+                                  color: Colors.white70,
+                                  size: 20,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+
+                        const SizedBox(height: 18),
+                        Divider(color: Colors.white24),
+                        const SizedBox(height: 12),
+
+                        // ============================================================
+                        // BASIC AIRPORT INFO
+                        // ============================================================
+                        _infoRow("ICAO", airport.icao),
+                        _infoRow("Name", airport.name),
+                        _infoRow("Country", airport.country),
+                        _infoRow(
+                          "Elevation",
+                          "${airport.elevation.toStringAsFixed(0)} ft",
+                        ),
+                        _infoRow(
+                          "Type",
+                          airport.isMilitary ? "Military" : "Civilian",
+                        ),
+
+                        const SizedBox(height: 20),
+
+                        // ============================================================
+                        // AIRPORT FREQUENCIES
+                        // ============================================================
+                        Builder(
+                          builder: (_) {
+                            final freqs = _freqByIcao[airport.icao] ?? [];
+
+                            if (freqs.isEmpty) {
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Divider(color: Colors.white24),
+                                  const SizedBox(height: 16),
+                                  const Text(
+                                    "Frequencies",
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  const Text(
+                                    "No frequencies available",
+                                    style: TextStyle(
+                                      color: Colors.white54,
                                       fontSize: 14,
                                     ),
                                   ),
-                                ),
+                                ],
+                              );
+                            }
 
-                                Text(
-                                  "$mhz MHz",
+                            final unique = <String, AirportFrequency>{};
+                            for (final f in freqs) {
+                              unique["${f.type}_${f.frequency}"] = f;
+                            }
+
+                            final cleanList = unique.values.toList();
+
+                            String friendly(String t) {
+                              switch (t) {
+                                case "T":
+                                  return "Tower";
+                                case "G":
+                                  return "Ground";
+                                case "A":
+                                  return "Approach";
+                                case "RDO":
+                                  return "Radio";
+                                case "RDR":
+                                  return "Radar";
+                                case "DIR":
+                                  return "Director";
+                                case "ATIS":
+                                  return "ATIS";
+                                case "APT":
+                                  return "Airport";
+                                default:
+                                  return t;
+                              }
+                            }
+
+                            IconData iconFor(String t) {
+                              switch (t) {
+                                case "T":
+                                  return Icons.airplanemode_active;
+                                case "G":
+                                  return Icons.local_taxi;
+                                case "A":
+                                  return Icons.south_west;
+                                case "RDO":
+                                  return Icons.wifi_tethering;
+                                case "RDR":
+                                  return Icons.radar;
+                                case "DIR":
+                                  return Icons.splitscreen;
+                                case "ATIS":
+                                  return Icons.speaker;
+                                default:
+                                  return Icons.radio;
+                              }
+                            }
+
+                            Color colorFor(String t) {
+                              switch (t) {
+                                case "T":
+                                  return Colors.orangeAccent;
+                                case "G":
+                                  return Colors.greenAccent;
+                                case "A":
+                                  return Colors.cyanAccent;
+                                case "RDO":
+                                  return Colors.purpleAccent;
+                                case "RDR":
+                                  return Colors.redAccent;
+                                case "DIR":
+                                  return Colors.yellowAccent;
+                                case "ATIS":
+                                  return Colors.blueAccent;
+                                default:
+                                  return Colors.white70;
+                              }
+                            }
+
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Divider(color: Colors.white24),
+                                const SizedBox(height: 16),
+                                const Text(
+                                  "Frequencies",
                                   style: TextStyle(
-                                    color: colorFor(f.type),
-                                    fontSize: 14,
+                                    color: Colors.white,
+                                    fontSize: 15,
                                     fontWeight: FontWeight.bold,
                                   ),
                                 ),
-                              ],
-                            ),
-                          );
-                        }),
-                      ],
-                    );
-                  },
-                ),
+                                const SizedBox(height: 10),
+                                ...cleanList.map((f) {
+                                  final mhz = (f.frequency / 1000.0)
+                                      .toStringAsFixed(3);
 
-                const SizedBox(height: 6),
-                // ============================================================
-                // DIRECT TO BUTTON
-                // ============================================================
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    onPressed: () async {
-                      Navigator.pop(context);
-                      await _createDirectFlightTo(airport.icao);
-                    },
-                    icon: const Icon(Icons.flight_takeoff, size: 20),
-                    label: const Text("Direct To"),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.cyanAccent.withOpacity(0.2),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 6,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          iconFor(f.type),
+                                          size: 18,
+                                          color: colorFor(f.type),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Text(
+                                            friendly(f.type) +
+                                                (f.description != null &&
+                                                        f
+                                                            .description!
+                                                            .isNotEmpty
+                                                    ? " – ${f.description}"
+                                                    : ""),
+                                            style: const TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 14,
+                                            ),
+                                          ),
+                                        ),
+                                        Text(
+                                          "$mhz MHz",
+                                          style: TextStyle(
+                                            color: colorFor(f.type),
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                }),
+                              ],
+                            );
+                          },
+                        ),
+
+                        const SizedBox(height: 20),
+
+                        // ============================================================
+                        // DIRECT TO BUTTON
+                        // ============================================================
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            onPressed: () async {
+                              Navigator.pop(context);
+                              await _createDirectFlightTo(airport.icao);
+                            },
+                            icon: const Icon(Icons.flight_takeoff, size: 20),
+                            label: const Text("Direct To"),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.cyanAccent.withOpacity(
+                                0.2,
+                              ),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 12),
+                      ],
                     ),
                   ),
                 ),
-
-                const SizedBox(height: 12),
-              ],
+              ),
             ),
           ),
+        );
+      },
+      transitionBuilder: (context, animation, secondaryAnimation, child) {
+        final slide = Tween<Offset>(
+          begin: const Offset(1, 0),
+          end: Offset.zero,
+        ).animate(
+          CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+        );
+
+        return SlideTransition(
+          position: slide,
+          child: FadeTransition(opacity: animation, child: child),
         );
       },
     );
@@ -2598,46 +3025,237 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _saveTrail(List<LatLng> trail) async {
-    final prefs = await SharedPreferences.getInstance();
-    final encoded = jsonEncode(
-      trail.map((e) => [e.latitude, e.longitude]).toList(),
+  Map<String, dynamic>? _latLngToJson(LatLng? point) {
+  if (point == null) return null;
+  return {
+    'lat': point.latitude,
+    'lng': point.longitude,
+  };
+}
+
+DateTime? _readDateTime(dynamic value) {
+  if (value == null) return null;
+  return DateTime.tryParse(value.toString());
+}
+
+Future<void> _saveUiShellState() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  final data = <String, dynamic>{
+    'followAircraft': _followAircraft,
+    'mapRotation': _mapRotation,
+    'currentZoom': _currentZoom,
+    'mapCenter': _latLngToJson(_mapCenter),
+    'showSideMenu': _showSideMenu,
+    'showMetar': _showMetar,
+    'showRawMetar': _showRawMetar,
+    'showPoi': _showPoi,
+    'showAirways': _showAirways,
+    'showRunways': _showRunways,
+    'showParking': _showParking,
+    'showWaypoints': _showWaypoints,
+    'showVOR': _showVOR,
+    'showNDB': _showNDB,
+    'showGround': _showGround,
+    'showAllFlights': _showAllFlights,
+    'showGroundOpsManually': _showGroundOpsManually,
+    'infoCardTop': _infoCardTop,
+    'infoCardLeft': _infoCardLeft,
+    'selectedMapObjectType': _selectedMapObjectType,
+  };
+
+  await prefs.setString('map_ui_shell_state', jsonEncode(data));
+}
+
+Future<void> _loadUiShellState() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString('map_ui_shell_state');
+  if (raw == null) return;
+
+  try {
+    final data = jsonDecode(raw) as Map<String, dynamic>;
+
+    _followAircraft = data['followAircraft'] ?? true;
+    _mapRotation = (data['mapRotation'] as num?)?.toDouble() ?? 0.0;
+    _currentZoom = (data['currentZoom'] as num?)?.toDouble() ?? _currentZoom;
+
+    final center = data['mapCenter'];
+    if (center != null) {
+      _mapCenter = LatLng(
+        (center['lat'] as num).toDouble(),
+        (center['lng'] as num).toDouble(),
+      );
+    }
+
+    _showSideMenu = data['showSideMenu'] == true;
+    _showMetar = data['showMetar'] == true;
+    _showRawMetar = data['showRawMetar'] != false;
+    _showPoi = data['showPoi'] == true;
+    _showAirways = data['showAirways'] == true;
+    _showRunways = data['showRunways'] != false;
+    _showParking = data['showParking'] != false;
+    _showWaypoints = data['showWaypoints'] == true;
+    _showVOR = data['showVOR'] != false;
+    _showNDB = data['showNDB'] == true;
+    _showGround = data['showGround'] != false;
+    _showAllFlights = data['showAllFlights'] == true;
+    _showGroundOpsManually = data['showGroundOpsManually'] == true;
+
+    _infoCardTop = (data['infoCardTop'] as num?)?.toDouble() ?? _infoCardTop;
+    _infoCardLeft = (data['infoCardLeft'] as num?)?.toDouble() ?? _infoCardLeft;
+    _selectedMapObjectType = data['selectedMapObjectType'] as String?;
+  } catch (e) {
+    debugPrint('❌ Failed to restore UI shell state: $e');
+  }
+}
+
+Future<void> _saveFlightRuntimeSnapshot() async {
+  final prefs = await SharedPreferences.getInstance();
+
+  final data = <String, dynamic>{
+    'inFlight': _inFlight,
+    'flightSessionActive': _flightSessionActive,
+    'flightQualified': _flightQualified,
+    'startTime': _startTime?.toIso8601String(),
+    'takeoffTimestamp': _takeoffTimestamp?.toIso8601String(),
+    'touchdownTime': _touchdownTime?.toIso8601String(),
+    'startPoint': _latLngToJson(_startPoint),
+    'trail': _trail
+        .map((p) => {'lat': p.latitude, 'lng': p.longitude})
+        .toList(),
+    'backendTrail': _backendTrail,
+    'isGrounded': _isGrounded,
+    'pendingFlightEnd': _pendingFlightEnd,
+    'pendingEndTime': _pendingEndTime?.toIso8601String(),
+    'runwayUsedDeparture': _runwayUsedDeparture,
+    'runwayUsedArrival': _runwayUsedArrival,
+    'parkingStart': _parkingStart,
+    'parkingEnd': _parkingEnd,
+    'maxAltitude': _maxAltitude,
+    'airspeedSum': _airspeedSum,
+    'airspeedSamples': _airspeedSamples,
+    'cruiseConfirmed': _cruiseConfirmed,
+    'fuelGallons': _fuelGallons,
+    'fuelMinutesLeft': _fuelMinutesLeft,
+    'finalParkedAnnounced': _finalParkedAnnounced,
+  };
+
+  await prefs.setString('map_flight_runtime', jsonEncode(data));
+}
+
+Future<void> _loadFlightRuntimeSnapshot() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString('map_flight_runtime');
+  if (raw == null) return;
+
+  try {
+    final data = jsonDecode(raw) as Map<String, dynamic>;
+
+    _inFlight = data['inFlight'] == true;
+    _flightSessionActive = data['flightSessionActive'] == true;
+    _flightQualified = data['flightQualified'] == true;
+
+    _startTime = _readDateTime(data['startTime']);
+    _takeoffTimestamp = _readDateTime(data['takeoffTimestamp']);
+    _touchdownTime = _readDateTime(data['touchdownTime']);
+
+    final start = data['startPoint'];
+    if (start != null) {
+      _startPoint = LatLng(
+        (start['lat'] as num).toDouble(),
+        (start['lng'] as num).toDouble(),
+      );
+    }
+
+    final trail = (data['trail'] as List? ?? []);
+    _trail = trail
+        .map((e) => LatLng(
+              (e['lat'] as num).toDouble(),
+              (e['lng'] as num).toDouble(),
+            ))
+        .toList();
+
+    final backendTrail = (data['backendTrail'] as List? ?? []);
+    _backendTrail = List<Map<String, dynamic>>.from(
+      backendTrail.map((e) => Map<String, dynamic>.from(e)),
     );
-    await prefs.setString('flight_trail', encoded);
+
+    _isGrounded = data['isGrounded'] as bool?;
+    _pendingFlightEnd = data['pendingFlightEnd'] == true;
+    _pendingEndTime = _readDateTime(data['pendingEndTime']);
+
+    _runwayUsedDeparture = data['runwayUsedDeparture'] as String?;
+    _runwayUsedArrival = data['runwayUsedArrival'] as String?;
+    _parkingStart = data['parkingStart'] as String?;
+    _parkingEnd = data['parkingEnd'] as String?;
+
+    _maxAltitude = (data['maxAltitude'] as num?)?.toDouble() ?? 0.0;
+    _airspeedSum = (data['airspeedSum'] as num?)?.toDouble() ?? 0.0;
+    _airspeedSamples = (data['airspeedSamples'] as num?)?.toInt() ?? 0;
+
+    _cruiseConfirmed = data['cruiseConfirmed'] == true;
+    _fuelGallons = (data['fuelGallons'] as num?)?.toDouble() ?? 0.0;
+    _fuelMinutesLeft = (data['fuelMinutesLeft'] as num?)?.toDouble() ?? 999.0;
+
+    _finalParkedAnnounced = data['finalParkedAnnounced'] == true;
+
+    if (!mounted) return;
+    setState(() {});
+    _refreshLiveMapVisuals();
+  } catch (e) {
+    debugPrint('❌ Failed to restore flight runtime snapshot: $e');
   }
+}
 
-  Future<void> _loadTrail() async {
-    if (!_inFlight) {
-      // Do NOT restore old trails if not mid-flight
-      return;
-    }
+Future<void> _clearFlightRuntimeSnapshot() async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.remove('map_flight_runtime');
+  await prefs.remove('flight_trail');
+  await prefs.remove('start_lat');
+  await prefs.remove('start_lng');
+}
 
-    final prefs = await SharedPreferences.getInstance();
-    final encoded = prefs.getString('flight_trail');
-    if (encoded == null) return;
 
-    try {
-      final List<dynamic> raw = jsonDecode(encoded);
-      final restored =
-          raw
-              .map<LatLng>((e) => LatLng(e[0] as double, e[1] as double))
-              .toList();
+ Future<void> _saveTrail(List<LatLng> trail) async {
+  final prefs = await SharedPreferences.getInstance();
+  final encoded = jsonEncode(
+    trail
+        .map((e) => {'lat': e.latitude, 'lng': e.longitude})
+        .toList(),
+  );
+  await prefs.setString('flight_trail', encoded);
+}
 
+Future<void> _loadTrail() async {
+  final prefs = await SharedPreferences.getInstance();
+  final encoded = prefs.getString('flight_trail');
+  if (encoded == null) return;
+
+  try {
+    final List<dynamic> raw = jsonDecode(encoded);
+    final restored = raw
+        .map<LatLng>((e) => LatLng(
+              (e['lat'] as num).toDouble(),
+              (e['lng'] as num).toDouble(),
+            ))
+        .toList();
+
+    if (!mounted) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-
-      // ❗ Delay inserting trail until AFTER map is ready
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        setState(() {
-          _trail.clear();
-          _trail.addAll(restored);
-        });
-        print("🟢 Trail restored with ${_trail.length} points.");
+      setState(() {
+        _trail
+          ..clear()
+          ..addAll(restored);
       });
-    } catch (e) {
-      print('❌ Error loading trail: $e');
-    }
+      _refreshLiveMapVisuals();
+      debugPrint("🟢 Trail restored with ${_trail.length} points.");
+    });
+  } catch (e) {
+    debugPrint('❌ Error loading trail: $e');
   }
+}
 
   void _toggleFlightState() async {
     final prefs = await SharedPreferences.getInstance();
@@ -2656,25 +3274,234 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _loadInFlight() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (!mounted) return;
+ Future<void> _loadInFlight() async {
+  await _loadFlightRuntimeSnapshot();
+}
 
-    // ⚠️ Never restore real flight state from disk
-    // Flight sessions are ephemeral and must be telemetry-driven
-    setState(() {
-      _inFlight = false;
-      _flightSessionActive = false;
-    });
+  Future<void> _loadAllFlightLogs() async {
+    if (_loadingFlightLogs) return;
 
-    // 🧹 Defensive cleanup: stale prefs from crashes / force closes
-    await prefs.remove('in_flight');
-    await prefs.remove('flight_start_time');
+    setState(() => _loadingFlightLogs = true);
 
-    // 🧠 Pulse is ONLY started when auto-flight detects takeoff
-    _pulseController.stop();
+    try {
+      final token = await SessionManager.loadToken();
 
-    print("🔁 Flight session reset — waiting for auto-flight detection");
+      if (token == null) {
+        if (!mounted) return;
+        setState(() => _loadingFlightLogs = false);
+        return;
+      }
+
+      final userId = _extractUserIdFromToken(token);
+      if (userId == null || userId.isEmpty) {
+        if (!mounted) return;
+        setState(() => _loadingFlightLogs = false);
+        return;
+      }
+
+      _flightLogsUserId = userId;
+
+      final logs = await FlightLogService.getFlightLogs(userId);
+
+      if (!mounted) return;
+      setState(() {
+        _flightLogs = logs;
+        _loadingFlightLogs = false;
+      });
+    } catch (e) {
+      print('❌ Failed loading all flight logs: $e');
+      if (!mounted) return;
+      setState(() => _loadingFlightLogs = false);
+    }
+  }
+
+  String? _extractUserIdFromToken(String token) {
+    try {
+      final parts = token.split('.');
+      if (parts.length != 3) return null;
+
+      final payload = utf8.decode(
+        base64Url.decode(base64Url.normalize(parts[1])),
+      );
+
+      final data = jsonDecode(payload) as Map<String, dynamic>;
+
+      return data['id']?.toString() ??
+          data['_id']?.toString() ??
+          data['userId']?.toString();
+    } catch (e) {
+      print('❌ Could not decode token for userId: $e');
+      return null;
+    }
+  }
+
+  void _captureLandingReplaySample(SimLinkData data, DateTime now) {
+    final sample = LandingReplaySample(
+      lat: data.latitude,
+      lng: data.longitude,
+      heading: data.heading,
+      airspeed: data.airspeed,
+      altitude: data.altitude,
+      verticalSpeed: data.verticalSpeed,
+      onGround: data.onGround,
+      timestamp: now,
+    );
+
+    _landingReplayBuffer.add(sample);
+
+    _landingReplayBuffer.removeWhere(
+      (e) => now.difference(e.timestamp).inSeconds > 30,
+    );
+
+    if (_recordLandingRollout) {
+      _landingReplayFinal.add(sample);
+
+      final touchdownAge =
+          _touchdownTime == null
+              ? 0
+              : now.difference(_touchdownTime!).inSeconds;
+
+      if (touchdownAge > 25 || data.airspeed < 20) {
+        _recordLandingRollout = false;
+      }
+    }
+  }
+
+  double _estimateRunwayHeading(String? runway) {
+    if (runway == null || runway.isEmpty) return 0;
+
+    final match = RegExp(r'(\d{2})').firstMatch(runway);
+    if (match == null) return 0;
+
+    final numPart = int.tryParse(match.group(1)!);
+    if (numPart == null) return 0;
+
+    return numPart * 10.0;
+  }
+
+  Landing2d? _buildLanding2dPayload() {
+    if (_landingReplayFinal.isEmpty) return null;
+
+    LandingReplaySample? touchdown;
+
+    for (final sample in _landingReplayFinal) {
+      if (sample.onGround) {
+        touchdown = sample;
+        break;
+      }
+    }
+
+    touchdown ??= _landingReplayFinal.last;
+
+    final rolloutSeconds =
+        _touchdownTime == null
+            ? 0
+            : DateTime.now().difference(_touchdownTime!).inSeconds;
+
+    return Landing2d(
+      runway: _runwayUsedArrival ?? '',
+      runwayHeading: _estimateRunwayHeading(_runwayUsedArrival),
+      touchdownLat: touchdown.lat,
+      touchdownLng: touchdown.lng,
+      touchdownHeading: touchdown.heading,
+      touchdownVerticalSpeed: touchdown.verticalSpeed,
+      touchdownGroundSpeed: touchdown.airspeed,
+      touchdownPitch: simData?.pitch ?? 0,
+      touchdownBank: simData?.slipBetaDeg ?? 0,
+      hardLanding: touchdown.verticalSpeed.abs() > 500,
+      butterScore: (logSafeInt(_lastLandingRating) ?? 0),
+      rolloutSeconds: rolloutSeconds,
+      samples: _landingReplayFinal.map((e) => e.toLanding2dSample()).toList(),
+    );
+  }
+
+  int? logSafeInt(String? value) {
+    if (value == null) return null;
+    return int.tryParse(value.replaceAll(RegExp(r'[^0-9-]'), ''));
+  }
+
+  List<Polyline> _buildFlightHistoryPolylines() {
+    return _flightLogs.where((log) => log.trail.length >= 2).map((log) {
+      final start = log.trail.first;
+      final end = log.trail.last;
+
+      return Polyline(
+        points: [LatLng(start.lat, start.lng), LatLng(end.lat, end.lng)],
+        strokeWidth: 2.2,
+        color: const Color.fromARGB(255, 57, 35, 255).withOpacity(0.55),
+      );
+    }).toList();
+  }
+
+  List<Marker> _buildFlightHistoryMarkers() {
+    final markers = <Marker>[];
+
+    for (final log in _flightLogs) {
+      if (log.trail.isEmpty) continue;
+
+      final start = log.trail.first;
+      final end = log.trail.last;
+
+      markers.add(
+        Marker(
+          point: LatLng(start.lat, start.lng),
+          width: 20,
+          height: 20,
+          child: const Icon(
+            Icons.flight_takeoff,
+            size: 14,
+            color: Colors.cyanAccent,
+          ),
+        ),
+      );
+
+      if (log.trail.length > 1) {
+        markers.add(
+          Marker(
+            point: LatLng(end.lat, end.lng),
+            width: 20,
+            height: 20,
+            child: const Icon(
+              Icons.flight_land,
+              size: 14,
+              color: Colors.redAccent,
+            ),
+          ),
+        );
+      }
+    }
+
+    return markers;
+  }
+
+  IconData poiIconForType(String type) {
+    switch (type) {
+      case 'historic':
+        return Icons.account_balance;
+      case 'landmark':
+        return Icons.location_city;
+      case 'natural':
+        return Icons.terrain;
+      case 'weird':
+        return Icons.visibility;
+      default:
+        return Icons.place;
+    }
+  }
+
+  Color poiColorForType(String type) {
+    switch (type) {
+      case 'historic':
+        return Colors.amber;
+      case 'landmark':
+        return Colors.lightBlueAccent;
+      case 'natural':
+        return Colors.lightGreenAccent;
+      case 'weird':
+        return Colors.deepPurpleAccent;
+      default:
+        return Colors.white;
+    }
   }
 
   Future<void> _saveTurbulenceEvents() async {
@@ -2685,17 +3512,33 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
   Future<void> _loadTurbulenceEvents() async {
     final prefs = await SharedPreferences.getInstance();
+
+    // ✅ Never restore turbulence into a fresh/non-active session
+    if (!_inFlight || _currentFlight == null) {
+      await prefs.remove('turbulence_events');
+      if (!mounted) return;
+
+      setState(() {
+        _turbulenceEvents.clear();
+      });
+      _refreshLiveMapVisuals();
+      return;
+    }
+
     final encoded = prefs.getString('turbulence_events');
     if (encoded == null) return;
+
     try {
       final List<dynamic> raw = jsonDecode(encoded);
+
       if (!mounted) return;
       setState(() {
         _turbulenceEvents.clear();
         _turbulenceEvents.addAll(raw.map((e) => TurbulenceEvent.fromJson(e)));
       });
+      _refreshLiveMapVisuals();
     } catch (e) {
-      print('Error loading turbulence events: \$e');
+      print('❌ Error loading turbulence events: $e');
     }
   }
 
@@ -2813,13 +3656,9 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     _turbulenceEvents.add(TurbulenceEvent(latlng, level, now));
     await _saveTurbulenceEvents();
 
-    debugPrint(
-      "🌪️ $level turbulence | "
-      "VSΔ=${vsDelta.toStringAsFixed(0)} fpm "
-      "yawΔ=${yawDelta.toStringAsFixed(1)}°/s",
-    );
-
     _updateLastTurbSamples(data);
+
+    _refreshLiveMapVisuals();
   }
 
   void _updateLastTurbSamples(SimLinkData data) {
@@ -2887,22 +3726,28 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   Future<void> _startFlight() async {
     final prefs = await SharedPreferences.getInstance();
     final userId = prefs.getString('user_id');
-
+    await _resetLiveFlightVisuals();
     print("🧪 StartFlight — userId = $userId");
+
+    _livePhase = null;
+    _pendingPhase = null;
+    _pendingPhaseSince = null;
+    _lastLandedEventTime = null;
+    _finalParkedAnnounced = false;
+    _lastAnnouncedPhase = null;
 
     // ------------------------------------------------------------
     // 🔗 Bind flight to active job (if any)
     // ------------------------------------------------------------
-    if (widget.jobId != null) {
+    if (widget.jobId != null && widget.jobId!.isNotEmpty) {
       await prefs.setString('flight_job_id', widget.jobId!);
       print("🧭 Flight bound to job ${widget.jobId}");
     } else if (userId != null) {
       final activeJob = await DispatchService.getActiveJob(userId);
 
-      if (activeJob != null && activeJob['job'] != null) {
-        final jobId = activeJob['job']['_id'];
-        await prefs.setString('flight_job_id', jobId);
-        print("🧭 Flight bound to job $jobId");
+      if (activeJob != null) {
+        await prefs.setString('flight_job_id', activeJob.id);
+        print("🧭 Flight bound to job ${activeJob.id}");
       }
     }
 
@@ -2943,6 +3788,7 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     _backendTrail.clear();
     _turbulenceEvents.clear();
     _lastBackendTrailUpdate = null;
+    _refreshLiveMapVisuals();
 
     // IMPORTANT: reset departure runway here
     _runwayUsedDeparture = 'N/A';
@@ -2985,18 +3831,32 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   }
 
   Future<void> _endFlight() async {
-    await _finalizeAndUploadFlight();
+    if (_isFinalizingFlight) return;
+
+    _isFinalizingFlight = true;
+
+    try {
+      final didSave = await _finalizeAndUploadFlight();
+
+      if (!didSave) {
+        print("⚠️ Manual end failed — flight not cleaned up");
+        showHudMessage("⚠️ Could not save flight");
+      }
+    } finally {
+      _isFinalizingFlight = false;
+    }
   }
 
   void _throttledUpdateAirportMarkers({bool force = false}) {
     if (_airportUpdateThrottle?.isActive ?? false) return;
 
-    _airportUpdateThrottle = Timer(const Duration(milliseconds: 250), () async {
+    _airportUpdateThrottle = Timer(const Duration(milliseconds: 250), () {
       if (!_mapReady || _airports.isEmpty) return;
 
-      WidgetsBinding.instance.addPostFrameCallback((_) async {
-        final camera = mapController.camera;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
 
+        final camera = mapController.camera;
         if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
 
         final zoom = camera.zoom;
@@ -3009,118 +3869,103 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
           _lastBounds = bounds;
         }
 
-        // Hide if too zoomed out
-        if (zoom < 5.0) {
-          if (mounted) setState(() => _airportMarkers = []);
+        const double hideZoom = 7.0;
+        const double detailZoom = 11.0;
+        const double clusterBucketSize = 2.5;
+
+        // =======================================================
+        // 1) HARD HIDE
+        // =======================================================
+        if (zoom < hideZoom) {
+          _airportMarkersNotifier.value = [];
           return;
         }
 
-        // Visible airports
         final visibleAirports =
-            _airports.where((a) {
-              return bounds.contains(LatLng(a.lat, a.lon));
-            }).toList();
-
-        // WEATHER CACHE (10 min interval)
-        await _updateWeatherCache(visibleAirports);
+            _airports
+                .where((a) => bounds.contains(LatLng(a.lat, a.lon)))
+                .toList();
 
         final List<Marker> markers = [];
 
         // =======================================================
-        // MODE A — FULL DETAIL
+        // 2) DETAIL MODE
         // =======================================================
-        if (zoom >= 9.0) {
+        if (zoom >= detailZoom) {
           for (final airport in visibleAirports) {
-            // --------------------------------------------------
-            // 🔎 CATEGORY FILTER (skip airport if category hidden)
-            // --------------------------------------------------
             final cat = categorizeAirport(airport);
+
             if ((cat == AirportCategory.airport && !_filterBig) ||
                 (cat == AirportCategory.heli && !_filterHeli)) {
               continue;
             }
 
-            // --------------------------------------------------
-            // AIRPORT CORE
-            // --------------------------------------------------
             final pos = LatLng(airport.lat, airport.lon);
-
             final isJobDest =
                 widget.jobTo != null &&
                 airport.icao == widget.jobTo!.toUpperCase();
 
             final baseColor = markerColor(cat);
 
-            // Cached METAR
-            final wx = _wxCache[airport.icao];
-            final wxCat = metarCategory(wx);
-            final wxColor = metarColor(wxCat);
+            final showLabel = zoom >= 12.0;
 
-            // --------------------------------------------------
-            // WEATHER RING (back layer)
-            // --------------------------------------------------
-            markers.add(
-              Marker(
-                point: pos,
-                width: 70,
-                height: 70,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.translucent,
-                  onTap: () => _showAirportInfo(airport),
-                  child:
-                      wx != null
-                          ? Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              Container(
-                                width: 28,
-                                height: 28,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  border: Border.all(color: wxColor, width: 2),
-                                ),
-                              ),
-                              Positioned(bottom: 0, child: wxIcon(wx)),
-                            ],
-                          )
-                          : const SizedBox(),
-                ),
-              ),
-            );
-
-            // --------------------------------------------------
-            // AIRPORT MARKER DOT
-            // --------------------------------------------------
             markers.add(
               Marker(
                 key: ValueKey('airport_${airport.icao}_$zoom'),
                 point: pos,
-                width: isJobDest ? 30 : 16,
-                height: isJobDest ? 30 : 16,
+                width: showLabel ? 84 : 40,
+                height: showLabel ? 52 : 40,
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: () => _showAirportInfo(airport),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: isJobDest ? Colors.orangeAccent : baseColor,
-                      border: Border.all(
-                        color:
-                            isJobDest
-                                ? Colors.redAccent
-                                : baseColor.withOpacity(0.8),
-                        width: isJobDest ? 3 : 1.2,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: baseColor.withOpacity(0.7),
-                          blurRadius: 6,
-                          spreadRadius: 2,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: isJobDest ? 18 : 14,
+                        height: isJobDest ? 18 : 14,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: isJobDest ? Colors.orangeAccent : baseColor,
+                          boxShadow: [
+                            BoxShadow(
+                              color: (isJobDest
+                                      ? Colors.orangeAccent
+                                      : baseColor)
+                                  .withOpacity(1.0),
+                              blurRadius: 18,
+                              spreadRadius: 3,
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
-                    child: Center(child: buildMarkerShape(cat, isJobDest)),
+                      ),
+
+                      if (showLabel)
+                        Transform.rotate(
+                          angle: _mapRotation * (pi / 180),
+                          child: Container(
+                            margin: const EdgeInsets.only(top: 3),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 5,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.65),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: Text(
+                              airport.icao,
+                              style: const TextStyle(
+                                fontSize: 9,
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                                fontFamily: 'RobotoMono',
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ),
@@ -3128,30 +3973,21 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
           }
         }
         // =======================================================
-        // MODE B — CLUSTER MODE (zoomed out)
+        // 3) CLUSTER MODE
         // =======================================================
         else {
           clusters.clear();
-          final bucketSize = zoom < 6.5 ? 4.0 : (zoom < 8.0 ? 2.0 : 0.0);
 
           for (final airport in visibleAirports) {
-            // --------------------------------------------------
-            // 🔎 CATEGORY FILTER (same logic as detailed view)
-            // --------------------------------------------------
             final cat = categorizeAirport(airport);
 
             if ((cat == AirportCategory.airport && !_filterBig) ||
                 (cat == AirportCategory.heli && !_filterHeli)) {
-              continue; // skip airport completely
+              continue;
             }
 
-            // --------------------------------------------------
-            // CLUSTER BUCKET ASSIGNMENT
-            // --------------------------------------------------
             final key =
-                bucketSize == 0
-                    ? airport.icao
-                    : '${(airport.lat / bucketSize).floor()}_${(airport.lon / bucketSize).floor()}';
+                '${(airport.lat / clusterBucketSize).floor()}_${(airport.lon / clusterBucketSize).floor()}';
 
             clusters.putIfAbsent(key, () => []).add(airport);
           }
@@ -3162,36 +3998,65 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
             final avgLon =
                 group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
 
+            final AirportCategory cat = categorizeAirport(group.first);
+            final Color dotColor = markerColor(cat);
+            final bool isSingle = group.length == 1;
+            final String countLabel =
+                group.length > 9 ? '9+' : '${group.length}';
+
             markers.add(
               Marker(
                 point: LatLng(avgLat, avgLon),
-                width: 36,
-                height: 34,
-                child: Column(
-                  children: [
-                    const Icon(
-                      Icons.local_airport,
-                      size: 14,
-                      color: Color.fromARGB(255, 15, 83, 173),
-                      shadows: [Shadow(color: Colors.cyan, blurRadius: 4)],
+                width: 28,
+                height: 28,
+                child: IgnorePointer(
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: isSingle ? 5 : 8,
+                          height: isSingle ? 5 : 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: dotColor,
+                            boxShadow: [
+                              BoxShadow(
+                                color: dotColor.withOpacity(0.95),
+                                blurRadius: isSingle ? 8 : 10,
+                                spreadRadius: isSingle ? 0.8 : 1.2,
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (!isSingle) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            countLabel,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              fontFamily: 'RobotoMono',
+                              color: Colors.white,
+                              shadows: [
+                                Shadow(color: Colors.black, blurRadius: 4),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
-                    Text(
-                      '${group.length}',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold,
-                        fontFamily: 'RobotoMono',
-                        color: Color.fromARGB(255, 98, 87, 240),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ),
             );
           }
         }
 
-        if (mounted) setState(() => _airportMarkers = markers);
+        if (mounted) {
+          _airportMarkersNotifier.value = markers;
+        }
+
         _throttledUpdateVorMarkers();
         _throttledUpdateNdbMarkers();
         _throttledUpdateRunwayPolylines();
@@ -3235,12 +4100,24 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       _lastSocketData = DateTime.now();
       _simLinkResponded = true;
 
-      setState(() {
-        simData = data;
+      final bool connectionStateChanged =
+          !_isConnected || _isConnecting || _isReconnecting;
+
+      // Update live sim packet WITHOUT forcing a rebuild here.
+      simData = data;
+
+      // Only rebuild if connection flags actually changed.
+      if (connectionStateChanged) {
+        setState(() {
+          _isConnected = true;
+          _isConnecting = false;
+          _isReconnecting = false;
+        });
+      } else {
         _isConnected = true;
         _isConnecting = false;
         _isReconnecting = false;
-      });
+      }
 
       _handleSimUpdate(data);
 
@@ -3279,14 +4156,11 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       try {
         final logs = await FlightLogService.getFlightLogs(userId);
         if (logs.isNotEmpty && logs.first.endLocation != null) {
-          _lastFlightDestination =
-              logs.first.endLocation != null
-                  ? LatLng(
-                    logs.first.endLocation!.lat,
-                    logs.first.endLocation!.lng,
-                  )
-                  : null;
-          _initialCenter = _lastFlightDestination; // 📍Set as camera center
+          _lastFlightDestination = LatLng(
+            logs.first.endLocation!.lat,
+            logs.first.endLocation!.lng,
+          );
+          _initialCenter = _lastFlightDestination;
         }
       } catch (e) {
         print('❌ Failed to fetch flight logs: $e');
@@ -3300,60 +4174,58 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
         ).getHq(token);
         if (hq != null) {
           _homeBase = LatLng(hq.lat, hq.lon);
-          _initialCenter ??= _homeBase; // fallback center
+          _initialCenter ??= _homeBase;
         }
       } catch (e) {
         print('❌ Failed to fetch HQ: $e');
       }
     }
 
-    _initialCenter ??= const LatLng(37.9838, 23.7275); // 💥 ultimate fallback
+    _initialCenter ??= const LatLng(37.9838, 23.7275);
 
     if (!mounted) return;
     setState(() {
       _initialCenterReady = true;
     });
+
+    _refreshLiveMapVisuals();
   }
 
-  void _disconnectFromSimLink() async {
-    final pos =
-        simData != null ? LatLng(simData!.latitude, simData!.longitude) : null;
+  
 
-    print("🔌 SimLink disconnect requested");
+ void _disconnectFromSimLink() async {
+  final fallbackCenter =
+      _mapCenter ??
+      (simData != null
+          ? LatLng(simData!.latitude, simData!.longitude)
+          : _initialCenter);
 
-    // Full force-close
-    await _socketService.dispose();
+  debugPrint("🔌 SimLink disconnect requested");
 
+  await _saveUiShellState();
+  await _saveFlightRuntimeSnapshot();
+  await _socketService.dispose();
+
+  simData = null;
+
+  if (!mounted) return;
+  setState(() {
+    _isConnected = false;
+    _isConnecting = false;
+    _isReconnecting = false;
+  });
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
     if (!mounted) return;
-    setState(() {
-      _isConnected = false;
-      _isConnecting = false;
-    });
 
-    // Restore map view
-    if (pos != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        try {
-          mapController.move(pos, mapController.camera.zoom);
-          mapController.rotate(0);
-        } catch (_) {}
-      });
-    }
-  }
-
-  Color _getMapStyleIconColor() {
-    final theme = tileLayers[_mapStyleIndex].name.toLowerCase();
-    switch (theme) {
-      case 'black':
-        return Colors.white;
-      case 'white':
-        return Colors.black;
-      case 'topomap':
-        return Colors.blueGrey;
-      default:
-        return Colors.blueAccent;
-    }
-  }
+    try {
+      if (fallbackCenter != null) {
+        mapController.move(fallbackCenter, _currentZoom);
+      }
+      mapController.rotate(_mapRotation);
+    } catch (_) {}
+  });
+}
 
   AirportLocation? _toAirportLocation(LatLng? point) {
     if (point == null || _airports.isEmpty) return null;
@@ -3787,10 +4659,10 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       return;
     }
 
-    // ⭐ OFFICIAL AVIATION DISTANCE (Vincenty)
-    final distanceNm = _calculateDistanceNm(origin, destination);
+    // ✅ Reset old route visuals before building a new route
+    await _resetPlannedRouteOnly();
 
-    // ⭐ Recommended cruise altitude (unchanged)
+    final distanceNm = _calculateDistanceNm(origin, destination);
     final cruiseAlt = _recommendedAltitude(distanceNm);
 
     final flight = Flight(
@@ -3806,22 +4678,25 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       destinationLat: destination.latitude,
       destinationLng: destination.longitude,
       missionId: null,
-
       cruiseAltitude: cruiseAlt,
       plannedFuel: 0,
     );
 
     await prefs.setString('last_flight', jsonEncode(flight.toJson()));
 
-    setState(() {
-      _currentFlight = flight;
-    });
+    if (mounted) {
+      setState(() {
+        _currentFlight = flight;
+      });
+    }
 
-    _checkFuelRange(); // unchanged
+    _checkFuelRange();
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('🧭 Direct flight to $destinationIcao set')),
-    );
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('🧭 Direct flight to $destinationIcao set')),
+      );
+    }
   }
 
   double _calculateDistanceNm(LatLng p1, LatLng p2) {
@@ -3946,6 +4821,8 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     AirportLocation? startLoc,
     AirportLocation? endLoc,
   ) async {
+    if (!mounted) return;
+
     await showDialog(
       context: context,
       builder:
@@ -3977,7 +4854,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
                 ),
                 Text("  Severe: ${log.events['turbulenceCount']['severe']}"),
                 const Divider(),
-
                 Text(
                   "🧈 Landing Score: ${log.events['butterScore'] ?? '--'} / 100",
                 ),
@@ -3995,20 +4871,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
             ],
           ),
     );
-  }
-
-  Future<String> _deriveFlightType() async {
-    final prefs = await SharedPreferences.getInstance();
-    final jobJson = prefs.getString('active_dispatch_job');
-
-    final hasJob = jobJson != null;
-
-    final hasRoute =
-        _currentFlight?.originIcao.isNotEmpty == true &&
-        _currentFlight?.destinationIcao.isNotEmpty == true;
-
-    if (hasJob && hasRoute) return 'free_with_job';
-    return 'free';
   }
 
   int _recommendedAltitude(double distanceNm) {
@@ -4130,45 +4992,56 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       return;
     }
 
-    final speedKt = (simData!.airspeed).clamp(40, 400);
-    final cruiseAlt = _currentFlight!.cruiseAltitude!.toDouble();
+    // Χρησιμοποιούμε το airspeed από το SimLinkData σου
+    final double speed = (simData!.airspeed).clamp(50, 500).toDouble();
+    final double currentAlt = simData!.altitude;
 
-    // ---------- DEST ETA ----------
-    etaDest = (_remainingNm / speedKt) * 60;
+    // ΠΑΝΤΑ κοιτάμε τι έχει βάλει ο χρήστης στο Autopilot Target
+    // Αν είναι 0, πέφτουμε στο Cruise Altitude του Flight Plan
+    final double targetAlt =
+        simData!.autopilot.altitudeTarget > 0
+            ? simData!.autopilot.altitudeTarget
+            : (_currentFlight!.cruiseAltitude?.toDouble() ?? 0);
 
-    // ---------- TOC ETA ----------
-    final distFromOrigin = _currentFlight!.estimatedDistanceNm - _remainingNm;
-    double distToTOC = _tocDistanceNm - distFromOrigin;
+    // ---------- 1. DESTINATION ETA ----------
+    etaDest = (_remainingNm / speed) * 60;
 
-    if (atCruiseAltitude) {
+    // ---------- 2. TOC (Top of Climb) ----------
+    // Αν το τρέχον υψόμετρο είναι κάτω από το Target του Autopilot
+    if (simData!.verticalSpeed > 100 && currentAlt < (targetAlt - 100)) {
+      double altToClimb = targetAlt - currentAlt;
+      // Χρησιμοποιούμε το Vertical Speed Target αν υπάρχει, αλλιώς το τρέχον VS
+      double vsForCalc =
+          simData!.autopilot.verticalSpeedTarget.abs() > 0
+              ? simData!.autopilot.verticalSpeedTarget.abs()
+              : simData!.verticalSpeed.abs();
+
+      etaTOC = (altToClimb / vsForCalc);
+      requiredClimbFpm = altToClimb / (etaTOC! > 0 ? etaTOC! : 1);
+    } else {
       etaTOC = 0;
-    } else {
-      etaTOC = distToTOC > 0 ? (distToTOC / speedKt) * 60 : 0;
-    }
-
-    // Required climb FPM
-    if (!atCruiseAltitude && etaTOC != null && etaTOC! > 0) {
-      final remainingAlt = cruiseAlt - simData!.altitude;
-      requiredClimbFpm = remainingAlt > 0 ? remainingAlt / etaTOC! : 0;
-    } else {
       requiredClimbFpm = 0;
     }
 
-    // ---------- TOD ETA ----------
-    final distToTOD = _remainingNm - _todDistanceNm;
+    // ---------- 3. TOD (Top of Descent) - Dynamic 3-to-1 ----------
+    // Εδώ το target είναι το Elevation του προορισμού (αν δεν το έχεις, βάλε 2000ft standard)
+    double arrivalAlt = 2000.0;
+    double altToLose = (currentAlt - arrivalAlt).clamp(0, 45000);
 
-    if (isStableCruise) {
-      etaTOD = distToTOD > 0 ? (distToTOD / speedKt) * 60 : 0;
+    // Πόσα μίλια χρειαζόμαστε για να χάσουμε το υψόμετρο (3nm ανά 1000ft)
+    double nmNeededForDescent = (altToLose / 1000) * 3;
+
+    // Απόσταση μέχρι το TOD
+    double distToTod = _remainingNm - nmNeededForDescent;
+
+    if (currentAlt > (arrivalAlt + 500) && distToTod > 0) {
+      etaTOD = (distToTod / speed) * 60;
+
+      // Πόσο VS θα χρειαστεί αν ξεκινούσαμε την κάθοδο ΤΩΡΑ
+      double timeToDest = (_remainingNm / speed) * 60;
+      requiredDescentFpm = timeToDest > 0 ? altToLose / timeToDest : 0;
     } else {
-      // If already descending or below cruise, TOD invalid
       etaTOD = 0;
-    }
-
-    // Required descent
-    if (etaTOD != null && etaTOD! > 0 && isStableCruise) {
-      final remainingAlt = simData!.altitude;
-      requiredDescentFpm = remainingAlt / etaTOD!;
-    } else {
       requiredDescentFpm = 0;
     }
   }
@@ -4180,38 +5053,46 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       return;
     }
 
-    final origin =
-        _currentFlight!.originIcao == 'LIVEPOS'
-            ? LatLng(_currentFlight!.originLat!, _currentFlight!.originLng!)
-            : _airportCoords[_currentFlight!.originIcao]!;
+    final LatLng currentPos = LatLng(simData!.latitude, simData!.longitude);
+    final LatLng dest = _airportCoords[_currentFlight!.destinationIcao]!;
 
-    final dest = _airportCoords[_currentFlight!.destinationIcao]!;
-    final totalNm = _calculateDistanceNm(origin, dest);
+    final double speed = (simData!.airspeed).clamp(50, 500).toDouble();
+    final double currentAlt = simData!.altitude;
+    final double targetAlt =
+        simData!.autopilot.altitudeTarget > 0
+            ? simData!.autopilot.altitudeTarget
+            : (_currentFlight!.cruiseAltitude?.toDouble() ?? 0);
 
-    // 🧠 Dynamically calculate current and target cruise altitudes
-    final currentAlt = simData!.altitude;
-    final targetCruise =
-        simData?.autopilot.altitudeTarget ??
-        _currentFlight?.cruiseAltitude ??
-        0;
-    final atTargetCruise = (currentAlt - targetCruise).abs() < 200;
+    // --------- 1. TOC POINT (Top of Climb) ---------
+    // Αν ανεβαίνουμε και το Target Alt είναι ψηλότερα από εμάς
+    if (simData!.verticalSpeed > 200 && currentAlt < (targetAlt - 200)) {
+      double altToClimb = targetAlt - currentAlt;
+      double vs =
+          simData!.autopilot.verticalSpeedTarget.abs() > 0
+              ? simData!.autopilot.verticalSpeedTarget.abs()
+              : simData!.verticalSpeed.abs();
 
-    // --------- TOC POINT ---------
-    if (isClimbing && !atTargetCruise) {
-      if (_tocDistanceNm > 0 && _tocDistanceNm < totalNm) {
-        _tocPoint = _pointOnRoute(origin, dest, _tocDistanceNm);
-      }
+      double minutesToReach = altToClimb / vs;
+      double nmToTOC = (speed / 60) * minutesToReach;
+
+      // Το TOC μπαίνει 'nmToTOC' μίλια μπροστά από εμάς προς τον προορισμό
+      _tocPoint = _pointOnRoute(currentPos, dest, nmToTOC);
     } else {
       _tocPoint = null;
     }
 
-    // --------- TOD POINT ---------
-    if (isStableCruise) {
-      final todFromOrigin = totalNm - _todDistanceNm;
+    // --------- 2. TOD POINT (Top of Descent) ---------
+    // Χρησιμοποιούμε τον κανόνα 3-to-1 για να βρούμε ΠΟΣΑ ΜΙΛΙΑ ΠΡΙΝ το Dest είναι το TOD
+    double arrivalAlt = 2000.0;
+    double altToLose = (currentAlt - arrivalAlt).clamp(0, 45000);
+    double nmNeededForDescent = (altToLose / 1000) * 3;
 
-      if (todFromOrigin > 0 && todFromOrigin < totalNm) {
-        _todPoint = _pointOnRoute(origin, dest, todFromOrigin);
-      }
+    // Το TOD είναι 'nmNeededForDescent' μίλια ΠΡΙΝ τον προορισμό
+    // Άρα η απόσταση από εμάς είναι: (Απόσταση μέχρι Dest) - (Απόσταση καθόδου)
+    double distFromCurrentToTod = _remainingNm - nmNeededForDescent;
+
+    if (currentAlt > (arrivalAlt + 500) && distFromCurrentToTod > 0) {
+      _todPoint = _pointOnRoute(currentPos, dest, distFromCurrentToTod);
     } else {
       _todPoint = null;
     }
@@ -4232,7 +5113,9 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     final saved = prefs.getInt(_mapStyleKey);
 
     if (saved != null && saved >= 0 && saved < tileLayers.length) {
-      setState(() => _mapStyleIndex = saved);
+      _mapStyleIndex = saved;
+      _refreshLiveMapVisuals();
+      if (mounted) setState(() {});
     }
   }
 
@@ -4374,60 +5257,34 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     return "Unstable Rotation 💀";
   }
 
-  void showHudMessage(String message) {
+  void showHudMessage(
+    String message, {
+    IconData icon = Icons.airplanemode_active,
+    Color accent = Colors.cyanAccent,
+  }) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context).clearSnackBars();
+    _cinematicHudTimer?.cancel();
 
-    final snack = SnackBar(
-      behavior: SnackBarBehavior.floating,
-      elevation: 0,
-      duration: const Duration(seconds: 3),
-      backgroundColor: Colors.transparent,
+    setState(() {
+      _cinematicHudMessage = message;
+      _cinematicHudIcon = icon;
+      _cinematicHudAccent = accent;
+    });
 
-      // ⭐⭐ FORCE TOP POSITION
-      margin: const EdgeInsets.only(top: 40, left: 40, right: 40, bottom: 0),
+    _hudFxController.stop();
+    _hudFxController.reset();
+    _hudFxController.forward();
 
-      content: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 20),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.80),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: Colors.cyanAccent.withOpacity(0.7),
-            width: 1.4,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.cyanAccent.withOpacity(0.35),
-              blurRadius: 18,
-              spreadRadius: 3,
-            ),
-          ],
-        ),
-        child: Center(
-          child: Text(
-            message,
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.w700,
-              shadows: [
-                Shadow(
-                  color: Colors.black,
-                  blurRadius: 6,
-                  offset: Offset(0, 1),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-
-    // ⭐ Show ON TOP
-    ScaffoldMessenger.of(context).showSnackBar(snack);
+    _cinematicHudTimer = Timer(const Duration(seconds: 4), () async {
+      if (!mounted) return;
+      await _hudFxController.reverse();
+      if (!mounted) return;
+      setState(() {
+        _cinematicHudMessage = null;
+        _cinematicHudIcon = null;
+      });
+    });
   }
 
   double _calculateButterScore(double vs) {
@@ -5276,307 +6133,303 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   }
 
   Future<void> _loadVors() async {
-    final jsonStr = await rootBundle.loadString('assets/data/vors.json');
-    final List<dynamic> jsonList = json.decode(jsonStr);
-
-    final vors = jsonList.map((e) => Vor.fromJson(e)).toList();
-
+    await NavRepository().loadVors();
     if (!mounted) return;
     setState(() {
-      _vors = vors;
+      _vors = NavRepository().vors; // Ίδια ονομασία!
     });
-
-    print("📡 Loaded ${_vors.length} VOR stations");
   }
 
   void _throttledUpdateVorMarkers({bool force = false}) {
-    if (!_showVOR || _vors.isEmpty) return;
-
     if (_vorUpdateThrottle?.isActive ?? false) return;
 
-    _vorUpdateThrottle = Timer(const Duration(milliseconds: 250), () async {
-      if (!_mapReady) return;
+    _vorUpdateThrottle = Timer(const Duration(milliseconds: 250), () {
+      if (!_mapReady || !_showVOR || _vors.isEmpty) return;
 
-      final camera = mapController.camera;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
 
-      if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
+        final camera = mapController.camera;
+        if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
 
-      final zoom = camera.zoom;
-      final bounds = camera.visibleBounds;
+        final zoom = camera.zoom;
+        final bounds = camera.visibleBounds;
 
-      // Hide ONLY at extreme zoom-out
-      if (zoom < 8) {
-        if (mounted) setState(() => _vorMarkers = []);
-        return;
-      }
+        if (!force && zoom == _lastVorZoom && bounds == _lastVorBounds) return;
 
-      // Prevent useless recalculations
-      if (!force && zoom == _lastVorZoom && bounds == _lastVorBounds) return;
-
-      if (!force) {
-        _lastVorZoom = zoom;
-        _lastVorBounds = bounds;
-      }
-
-      final List<Vor> visibleVors =
-          _vors.where((v) {
-            return bounds.contains(LatLng(v.lat, v.lon));
-          }).toList();
-
-      final List<Marker> markers = [];
-
-      // --------------------------
-      // MODE A — FULL DETAIL
-      // --------------------------
-      if (zoom >= 9.0) {
-        for (final v in visibleVors) {
-          markers.add(
-            Marker(
-              point: LatLng(v.lat, v.lon),
-              width: 26,
-              height: 26,
-              child: GestureDetector(
-                onTap: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text("VOR ${v.ident} – ${v.frequency} MHz"),
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
-                },
-                child: Container(
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: Colors.blueAccent.withOpacity(0.9),
-                    border: Border.all(color: Colors.white, width: 1.2),
-                  ),
-                  child: const Center(
-                    child: Text(
-                      "V",
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          );
+        if (!force) {
+          _lastVorZoom = zoom;
+          _lastVorBounds = bounds;
         }
-      }
-      // --------------------------
-      // MODE B — CLUSTER MODE
-      // --------------------------
-      else {
-        _vorClusters.clear();
 
-        final bucketSize = zoom < 6.5 ? 4.0 : (zoom < 8.0 ? 2.0 : 0.0);
+        const double hideZoom = 7.5;
+        const double detailZoom = 10.5;
+        const double clusterBucketSize = 2.2;
 
-        for (final v in visibleVors) {
+        if (zoom < hideZoom) {
+          _vorMarkersNotifier.value = [];
+          return;
+        }
+
+        final rawVisible =
+            _vors.where((v) => bounds.contains(LatLng(v.lat, v.lon))).toList();
+
+        final Map<String, Vor> uniqueVisible = {};
+        for (final v in rawVisible) {
           final key =
-              bucketSize == 0
-                  ? v.ident
-                  : '${(v.lat / bucketSize).floor()}_${(v.lon / bucketSize).floor()}';
-
-          _vorClusters.putIfAbsent(key, () => []).add(v);
+              '${v.ident}_${v.lat.toStringAsFixed(4)}_${v.lon.toStringAsFixed(4)}';
+          uniqueVisible[key] = v;
         }
 
-        for (final group in _vorClusters.values) {
-          final avgLat =
-              group.map((e) => e.lat).reduce((a, b) => a + b) / group.length;
-          final avgLon =
-              group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
+        final visible = uniqueVisible.values.toList();
 
-          markers.add(
-            Marker(
-              point: LatLng(avgLat, avgLon),
-              width: 30,
-              height: 30,
-              child: Column(
-                children: [
-                  Icon(
-                    Icons.radio,
-                    size: 12,
-                    color: Colors.blueAccent.withOpacity(0.8),
-                  ),
-                  Text(
-                    '${group.length}',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
+        final List<Marker> markers = [];
+
+        if (zoom >= detailZoom) {
+          for (final v in visible) {
+            markers.add(
+              Marker(
+                point: LatLng(v.lat, v.lon),
+                width: zoom >= 11.5 ? 72 : 30,
+                height: zoom >= 11.5 ? 48 : 30,
+                child: _buildSingleVorMarker(v, zoom),
               ),
-            ),
-          );
-        }
-      }
+            );
+          }
+        } else {
+          _vorClusters.clear();
 
-      // Update state
-      if (mounted) {
-        setState(() => _vorMarkers = markers);
-      }
+          for (final v in visible) {
+            final key =
+                '${(v.lat / clusterBucketSize).floor()}_${(v.lon / clusterBucketSize).floor()}';
+            _vorClusters.putIfAbsent(key, () => []).add(v);
+          }
+
+          for (final group in _vorClusters.values) {
+            final avgLat =
+                group.map((e) => e.lat).reduce((a, b) => a + b) / group.length;
+            final avgLon =
+                group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
+
+            markers.add(
+              Marker(
+                point: LatLng(avgLat, avgLon),
+                width: 26,
+                height: 26,
+                child: _buildVorClusterMarker(group, zoom),
+              ),
+            );
+          }
+        }
+
+        if (mounted) {
+          _vorMarkersNotifier.value = markers;
+        }
+      });
     });
   }
 
   Future<void> _loadNdbs() async {
-    final jsonStr = await rootBundle.loadString('assets/data/ndb.json');
-    final List<dynamic> jsonList = json.decode(jsonStr);
-
-    final items = jsonList.map((e) => Ndb.fromJson(e)).toList();
-
+    await NavRepository().loadNdbs();
     if (!mounted) return;
-    setState(() => _ndbs = items);
-
-    print("📡 Loaded ${_ndbs.length} NDB stations");
+    setState(() {
+      _ndbs = NavRepository().ndbs; // Ίδια ονομασία!
+    });
   }
 
   List<Marker> _buildNdbDetailMarkers(List<Ndb> visible) {
     return visible.map((n) {
       return Marker(
         point: LatLng(n.lat, n.lon),
-        width: 26,
-        height: 26,
+        width: 44,
+        height: 44,
         child: GestureDetector(
           onTap: () {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text("NDB ${n.ident} – ${n.frequency} kHz"),
-                duration: Duration(seconds: 2),
-              ),
-            );
+            setState(() {
+              _selectedMapObject = n;
+              _selectedMapObjectType = 'ndb';
+            });
           },
-          child: Container(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: Colors.orange.withOpacity(0.85),
-              border: Border.all(color: Colors.black, width: 1.2),
-            ),
-            child: const Center(
-              child: Text(
-                "N",
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 22,
+                height: 22,
+                child: CustomPaint(
+                  painter: NdbMarkerPainter(
+                    color: Colors.orange,
+                    strokeColor: Colors.white,
+                  ),
                 ),
               ),
-            ),
+              const SizedBox(height: 3),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xCC111111),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(
+                    color: Colors.orange.withOpacity(0.5),
+                    width: 0.7,
+                  ),
+                ),
+                child: Text(
+                  n.ident,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    height: 1.0,
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       );
     }).toList();
   }
 
-  List<Marker> _buildNdbClusterMarkers(List<Ndb> visible, double zoom) {
-    final Map<String, List<Ndb>> buckets = {};
-
-    final bucketSize = zoom < 6.5 ? 4.0 : (zoom < 8.0 ? 2.0 : 0.0);
-
-    for (final n in visible) {
-      final key =
-          bucketSize == 0
-              ? n.ident
-              : '${(n.lat / bucketSize).floor()}_${(n.lon / bucketSize).floor()}';
-
-      buckets.putIfAbsent(key, () => []).add(n);
-    }
-
-    return buckets.values.map((group) {
-      final avgLat =
-          group.map((e) => e.lat).reduce((a, b) => a + b) / group.length;
-      final avgLon =
-          group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
-
-      return Marker(
-        point: LatLng(avgLat, avgLon),
-        width: 30,
-        height: 30,
-        child: Column(
-          children: [
-            Icon(
-              Icons.radio_button_checked,
-              size: 12,
-              color: Colors.orangeAccent,
-            ),
-            Text(
-              "${group.length}",
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                fontSize: 11,
-              ),
-            ),
-          ],
-        ),
-      );
-    }).toList();
-  }
-
   void _throttledUpdateNdbMarkers({bool force = false}) {
-    if (!_showNDB || _ndbs.isEmpty) return;
-
     if (_ndbUpdateThrottle?.isActive ?? false) return;
 
-    _ndbUpdateThrottle = Timer(const Duration(milliseconds: 250), () async {
-      if (!_mapReady) return;
+    _ndbUpdateThrottle = Timer(const Duration(milliseconds: 250), () {
+      if (!_mapReady || !_showNDB || _ndbs.isEmpty) return;
 
-      final camera = mapController.camera;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
 
-      if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
+        final camera = mapController.camera;
+        if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
 
-      final zoom = camera.zoom;
-      final bounds = camera.visibleBounds;
+        final zoom = camera.zoom;
+        final bounds = camera.visibleBounds;
 
-      if (!force && zoom == _lastNdbZoom && bounds == _lastNdbBounds) return;
+        if (!force && zoom == _lastNdbZoom && bounds == _lastNdbBounds) return;
 
-      if (!force) {
-        _lastNdbZoom = zoom;
-        _lastNdbBounds = bounds;
-      }
+        if (!force) {
+          _lastNdbZoom = zoom;
+          _lastNdbBounds = bounds;
+        }
 
-      final visible =
-          _ndbs.where((n) {
-            return bounds.contains(LatLng(n.lat, n.lon));
-          }).toList();
+        const double hideZoom = 8.0;
+        const double detailZoom = 11.0;
+        const double clusterBucketSize = 2.0;
 
-      final List<Marker> markers =
-          zoom >= 9.0
-              ? _buildNdbDetailMarkers(visible)
-              : _buildNdbClusterMarkers(visible, zoom);
+        if (zoom < hideZoom) {
+          _ndbMarkersNotifier.value = [];
+          return;
+        }
 
-      if (mounted) setState(() => _ndbMarkers = markers);
+        final visible =
+            _ndbs.where((n) => bounds.contains(LatLng(n.lat, n.lon))).toList();
+
+        final List<Marker> markers = [];
+
+        if (zoom >= detailZoom) {
+          markers.addAll(_buildNdbDetailMarkers(visible));
+        } else {
+          _ndbClusters.clear();
+
+          for (final n in visible) {
+            final key =
+                '${(n.lat / clusterBucketSize).floor()}_${(n.lon / clusterBucketSize).floor()}';
+            _ndbClusters.putIfAbsent(key, () => []).add(n);
+          }
+
+          for (final group in _ndbClusters.values) {
+            final avgLat =
+                group.map((e) => e.lat).reduce((a, b) => a + b) / group.length;
+            final avgLon =
+                group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
+
+            final bool isSingle = group.length == 1;
+            final String countLabel =
+                group.length > 9 ? '9+' : '${group.length}';
+
+            markers.add(
+              Marker(
+                point: LatLng(avgLat, avgLon),
+                width: 26,
+                height: 26,
+                child: IgnorePointer(
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: isSingle ? 6 : 9,
+                          height: isSingle ? 6 : 9,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.orangeAccent,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.orangeAccent.withOpacity(0.95),
+                                blurRadius: isSingle ? 8 : 10,
+                                spreadRadius: isSingle ? 0.8 : 1.2,
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (!isSingle)
+                          Text(
+                            countLabel,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              fontFamily: 'RobotoMono',
+                              color: Colors.white,
+                              shadows: [
+                                Shadow(color: Colors.black, blurRadius: 4),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+        }
+
+        if (mounted) {
+          _ndbMarkersNotifier.value = markers;
+        }
+      });
     });
   }
 
   Future<void> _loadRunways() async {
-    try {
-      final jsonStr = await rootBundle.loadString('assets/data/runways.json');
-      final List<dynamic> jsonList = json.decode(jsonStr);
-
-      final runways = jsonList.map((e) => Runway.fromJson(e)).toList();
-
-      if (!mounted) return;
-      setState(() {
-        _runways = runways;
-      });
-
-      print("🛬 Loaded ${runways.length} runways");
-    } catch (e) {
-      print("❌ Error loading runways: $e");
-    }
+    await AirportDetailsRepository().loadRunways();
+    if (!mounted) return;
+    setState(() {
+      _runways = AirportDetailsRepository().runways; // Ίδια ονομασία!
+    });
   }
 
   List<Polyline> _buildRunwayPolylines(List<Runway> visible) {
+    final zoom = mapController.camera.zoom;
+
+    double getWidth(Runway r) {
+      final base = (r.width / 8).clamp(3.0, 16.0);
+
+      if (zoom < 11) return 0;
+      if (zoom < 12) return base * 0.5;
+      if (zoom < 13) return base * 0.7;
+      if (zoom < 14) return base;
+      return base * 1.2;
+    }
+
     return visible.map((r) {
       return Polyline(
         points: [LatLng(r.end1Lat, r.end1Lon), LatLng(r.end2Lat, r.end2Lon)],
-        strokeWidth: 4,
+        strokeWidth: getWidth(r),
         color: _runwayColorForSurface(r.surface),
+        borderStrokeWidth: zoom >= 13 ? 1.2 : 0.6,
+        borderColor: Colors.black.withOpacity(0.4),
       );
     }).toList();
   }
@@ -5729,21 +6582,21 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       final zoom = camera.zoom;
       final bounds = camera.visibleBounds;
 
-      if (!force && zoom == _lastParkingZoom && bounds == _lastParkingBounds)
+      if (!force && zoom == _lastParkingZoom && bounds == _lastParkingBounds) {
         return;
+      }
 
       if (!force) {
         _lastParkingZoom = zoom;
         _lastParkingBounds = bounds;
       }
 
-      // 💥 NEW RULE: HIDE BELOW 15
+      // hide below detail zoom
       if (zoom < 15.0) {
-        if (mounted) setState(() => _parkingMarkers = []);
+        _parkingMarkersNotifier.value = [];
         return;
       }
 
-      // Visible parkings
       final visible =
           _parkings.where((p) {
             return bounds.contains(LatLng(p.lat, p.lon));
@@ -5751,7 +6604,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
       final List<Marker> markers = [];
 
-      // ⭐ FULL DETAIL ONLY (we removed clustering)
       for (final p in visible) {
         markers.add(
           Marker(
@@ -5760,15 +6612,10 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
             height: 26,
             child: GestureDetector(
               onTap: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text(
-                      "🅿️ ${p.icao} – ${p.name} ${p.number}"
-                      "\nType: ${p.type}   Jetway: ${p.hasJetway ? 'YES' : 'NO'}",
-                    ),
-                    duration: const Duration(seconds: 2),
-                  ),
-                );
+                setState(() {
+                  _selectedMapObject = p;
+                  _selectedMapObjectType = 'parking';
+                });
               },
               child: Transform.rotate(
                 angle: p.heading * (pi / 180),
@@ -5797,230 +6644,389 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
         );
       }
 
-      if (mounted) setState(() => _parkingMarkers = markers);
+      _parkingMarkersNotifier.value = markers;
     });
   }
 
   Future<void> _loadParking() async {
-    try {
-      final jsonStr = await rootBundle.loadString('assets/data/parking.json');
-      final List<dynamic> jsonList = json.decode(jsonStr);
-
-      final spots = jsonList.map((e) => ParkingSpot.fromJson(e)).toList();
-
-      if (!mounted) return;
-
-      setState(() {
-        _parkings = spots;
-        _parkingSpots = spots;
-      });
-
-      print("🅿️ Loaded ${spots.length} parking spots");
-    } catch (e) {
-      print("❌ Failed to load parking.json → $e");
-    }
+    await AirportDetailsRepository().loadParking();
+    if (!mounted) return;
+    setState(() {
+      // Κρατάμε και τις δύο μεταβλητές σου αν τις χρησιμοποιείς και τις δύο
+      _parkings = AirportDetailsRepository().parkingSpots;
+      _parkingSpots = AirportDetailsRepository().parkingSpots;
+    });
   }
 
   Future<void> _loadWaypoints() async {
-    try {
-      final jsonStr = await rootBundle.loadString('assets/data/waypoints.json');
-      final List<dynamic> jsonList = json.decode(jsonStr);
+    final repo = WaypointRepository();
+    await repo.load(); // Αυτό πλέον δεν θα σου "παγώνει" την οθόνη!
 
-      final list = jsonList.map((e) => Waypoint.fromJson(e)).toList();
+    if (!mounted) return;
 
-      if (!mounted) return;
-      setState(() {
-        _waypoints = list;
-      });
-
-      print("🟢 Loaded ${_waypoints.length} waypoints.");
-    } catch (e) {
-      print("❌ Failed to load waypoints: $e");
-    }
+    setState(() {
+      _waypoints = repo.waypoints;
+    });
   }
 
   void _throttledUpdateWaypointMarkers({bool force = false}) {
-    if (!_showWaypoints || _waypoints.isEmpty) return;
     if (_waypointThrottle?.isActive ?? false) return;
 
-    _waypointThrottle = Timer(const Duration(milliseconds: 250), () async {
-      if (!_mapReady) return;
+    _waypointThrottle = Timer(const Duration(milliseconds: 250), () {
+      if (!_mapReady || !_showWaypoints || _waypoints.isEmpty) return;
 
-      final camera = mapController.camera;
-      if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
 
-      final zoom = camera.zoom;
-      final bounds = camera.visibleBounds;
+        final camera = mapController.camera;
+        if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
 
-      // Skip unnecessary recalculation
-      if (!force &&
-          zoom == _lastWaypointZoom &&
-          bounds == _lastWaypointBounds) {
-        return;
-      }
+        final zoom = camera.zoom;
+        final bounds = camera.visibleBounds;
 
-      if (!force) {
-        _lastWaypointZoom = zoom;
-        _lastWaypointBounds = bounds;
-      }
+        if (!force &&
+            zoom == _lastWaypointZoom &&
+            _lastWaypointBounds == bounds) {
+          return;
+        }
 
-      // Hard hide only at extreme world zoom
-      if (zoom < 4.8) {
-        if (mounted) setState(() => _waypointMarkers = []);
-        return;
-      }
+        if (!force) {
+          _lastWaypointZoom = zoom;
+          _lastWaypointBounds = bounds;
+        }
 
-      // Only visible waypoints
-      final visible =
-          _waypoints
-              .where((w) => bounds.contains(LatLng(w.lat, w.lon)))
-              .toList();
+        const double hideZoom = 9.0;
+        const double detailZoom = 12.0;
+        const double clusterBucketSize = 1.6;
 
-      final List<Marker> markers = [];
-      final double aircraftHeadingDeg = simData?.heading ?? 0.0;
-      final double textRotationRad = -aircraftHeadingDeg * pi / 180;
+        if (zoom < hideZoom) {
+          _waypointMarkersNotifier.value = [];
+          return;
+        }
 
-      // ========================================
-      // MODE A — FULL DETAIL (terminal / approach)
-      // ========================================
-      if (zoom >= 11.0) {
-        for (final w in visible) {
-          markers.add(
-            Marker(
-              point: LatLng(w.lat, w.lon),
-              width: 42,
-              height: 42,
-              child: GestureDetector(
-                onTap: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text(
-                        "FIX ${w.ident}\n${w.type}  "
-                        "(${w.lat.toStringAsFixed(4)}, "
-                        "${w.lon.toStringAsFixed(4)})",
-                      ),
-                      duration: const Duration(seconds: 2),
-                    ),
-                  );
-                },
-                child: Column(
-                  children: [
-                    const Icon(
-                      Icons.change_history,
-                      color: Colors.amberAccent,
-                      size: 16,
-                    ),
-                    Transform.rotate(
-                      angle: textRotationRad,
-                      child: Text(
-                        w.ident,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                          shadows: [Shadow(color: Colors.black, blurRadius: 4)],
+        final visible =
+            _waypoints
+                .where((w) => bounds.contains(LatLng(w.lat, w.lon)))
+                .toList();
+
+        final List<Marker> markers = [];
+
+        if (zoom >= detailZoom) {
+          for (final w in visible) {
+            final showLabel = zoom >= 13.0;
+
+            markers.add(
+              Marker(
+                point: LatLng(w.lat, w.lon),
+                width: showLabel ? 64 : 24,
+                height: showLabel ? 34 : 24,
+                child: GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      _selectedMapObject = w;
+                      _selectedMapObjectType = 'waypoint';
+                    });
+                  },
+                  child: SizedBox(
+                    width: showLabel ? 64 : 24,
+                    height: showLabel ? 34 : 24,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 5,
+                          height: 5,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.cyanAccent,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.cyanAccent.withOpacity(0.95),
+                                blurRadius: 8,
+                                spreadRadius: 0.8,
+                              ),
+                            ],
+                          ),
                         ),
+                        if (showLabel)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Container(
+                              constraints: const BoxConstraints(maxWidth: 60),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xCC111111),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(
+                                  color: Colors.cyanAccent.withOpacity(0.45),
+                                  width: 0.6,
+                                ),
+                              ),
+                              child: Text(
+                                w.ident,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                  height: 1.0,
+                                  shadows: [
+                                    Shadow(color: Colors.black, blurRadius: 4),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+        } else {
+          _waypointClusters.clear();
+
+          for (final w in visible) {
+            final key =
+                '${(w.lat / clusterBucketSize).floor()}_${(w.lon / clusterBucketSize).floor()}';
+            _waypointClusters.putIfAbsent(key, () => []).add(w);
+          }
+
+          for (final group in _waypointClusters.values) {
+            final avgLat =
+                group.map((e) => e.lat).reduce((a, b) => a + b) / group.length;
+            final avgLon =
+                group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
+
+            final bool isSingle = group.length == 1;
+            final String countLabel =
+                group.length > 9 ? '9+' : '${group.length}';
+
+            markers.add(
+              Marker(
+                point: LatLng(avgLat, avgLon),
+                width: 24,
+                height: 24,
+                child: IgnorePointer(
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: isSingle ? 5 : 8,
+                          height: isSingle ? 5 : 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.cyanAccent,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.cyanAccent.withOpacity(0.95),
+                                blurRadius: isSingle ? 8 : 10,
+                                spreadRadius: isSingle ? 0.8 : 1.2,
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (!isSingle)
+                          Text(
+                            countLabel,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              fontFamily: 'RobotoMono',
+                              color: Colors.white,
+                              shadows: [
+                                Shadow(color: Colors.black, blurRadius: 4),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+        }
+
+        if (mounted) {
+          _waypointMarkersNotifier.value = markers;
+        }
+      });
+    });
+  }
+
+  Future<void> _loadAirportFrequencies() async {
+    await FrequencyRepository().load();
+    if (!mounted) return;
+    setState(() {
+      _frequencies = FrequencyRepository().allFrequencies; // Ίδια ονομασία!
+      _freqByIcao = FrequencyRepository().freqByIcao; // Ίδια ονομασία!
+    });
+  }
+
+  Future<void> _loadAirways() async {
+    final repo = AirwayRepository();
+    await repo.load();
+
+    if (!mounted) return;
+
+    setState(() {
+      _airways = repo.segments;
+    });
+  }
+
+  void _throttledUpdateAirways({bool force = false}) {
+    if (_airwayThrottle?.isActive ?? false) return;
+
+    _airwayThrottle = Timer(const Duration(milliseconds: 250), () {
+      if (!_mapReady || !_showAirways || _airways.isEmpty) return;
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+
+        final camera = mapController.camera;
+        if (camera.zoom.isNaN || camera.visibleBounds.north == 0) return;
+
+        final zoom = camera.zoom;
+        final bounds = camera.visibleBounds;
+
+        if (!force && zoom == _lastAirwayZoom && bounds == _lastAirwayBounds) {
+          return;
+        }
+
+        if (!force) {
+          _lastAirwayZoom = zoom;
+          _lastAirwayBounds = bounds;
+        }
+
+        const double hideZoom = 7.5;
+        const double labelZoom = 9.2;
+
+        final int labelEvery =
+            zoom >= 11.5
+                ? 3
+                : zoom >= 10.5
+                ? 4
+                : zoom >= 9.5
+                ? 6
+                : 8;
+
+        if (zoom < hideZoom) {
+          _airwayPolylinesNotifier.value = [];
+          _airwayLabelsNotifier.value = [];
+          return;
+        }
+
+        final visible =
+            _airways.where((a) {
+              final from = LatLng(a.fromLat, a.fromLon);
+              final to = LatLng(a.toLat, a.toLon);
+
+              return bounds.contains(from) || bounds.contains(to);
+            }).toList();
+
+        final newPolylines = <Polyline>[];
+        final newLabels = <Marker>[];
+
+        // Prevent label spam for the same airway in the same viewport bucket.
+        final placedLabelKeys = <String>{};
+
+        for (int i = 0; i < visible.length; i++) {
+          final a = visible[i];
+          final from = LatLng(a.fromLat, a.fromLon);
+          final to = LatLng(a.toLat, a.toLon);
+
+          newPolylines.add(
+            Polyline(
+              points: [from, to],
+              strokeWidth: zoom >= 10.5 ? 1.8 : 1.1,
+              color: _airwayColor(a),
+            ),
+          );
+
+          if (zoom < labelZoom) continue;
+
+          final airwayName = a.airwayName.trim();
+          if (airwayName.isEmpty) continue;
+
+          // Label every few segments only, so the map stays readable.
+          if (i % labelEvery != 0) continue;
+
+          final mid = LatLng(
+            (from.latitude + to.latitude) / 2,
+            (from.longitude + to.longitude) / 2,
+          );
+
+          // Bucket labels so same airway doesn’t repeat too tightly together.
+          final bucketKey =
+              '${airwayName}_'
+              '${(mid.latitude * 2).floor()}_'
+              '${(mid.longitude * 2).floor()}';
+
+          if (placedLabelKeys.contains(bucketKey)) continue;
+          placedLabelKeys.add(bucketKey);
+
+          newLabels.add(
+            Marker(
+              point: mid,
+              width: 64,
+              height: 22,
+              child: IgnorePointer(
+                child: Center(
+                  child: Container(
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xCC1A1A1A),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: _airwayColor(a).withOpacity(0.8),
+                        width: 0.8,
                       ),
                     ),
-                  ],
+                    child: Text(
+                      airwayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: _airwayColor(a),
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.2,
+                        height: 1.0,
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ),
           );
         }
-      }
-      // ========================================
-      // MODE B — CLUSTER / DECLUTTER MODE
-      // ========================================
-      else {
-        _waypointClusters.clear();
 
-        final double bucketSize =
-            zoom < 6.5
-                ? 2.5 // country / FIR
-                : zoom < 8.5
-                ? 1.5 // regional
-                : zoom < 10.0
-                ? 0.8 // TMA
-                : 0.4; // near-terminal
-
-        for (final w in visible) {
-          final key =
-              '${(w.lat / bucketSize).floor()}_${(w.lon / bucketSize).floor()}';
-          _waypointClusters.putIfAbsent(key, () => []).add(w);
-        }
-
-        for (final group in _waypointClusters.values) {
-          final avgLat =
-              group.map((e) => e.lat).reduce((a, b) => a + b) / group.length;
-          final avgLon =
-              group.map((e) => e.lon).reduce((a, b) => a + b) / group.length;
-
-          markers.add(
-            Marker(
-              point: LatLng(avgLat, avgLon),
-              width: 36,
-              height: 36,
-              child: Column(
-                children: [
-                  Icon(
-                    Icons.change_history,
-                    color: Colors.amberAccent.withOpacity(0.85),
-                    size: 14,
-                  ),
-                  Transform.rotate(
-                    angle: textRotationRad,
-                    child: Text(
-                      '${group.length}',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        shadows: [Shadow(color: Colors.black, blurRadius: 3)],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        }
-      }
-
-      if (mounted) {
-        setState(() => _waypointMarkers = markers);
-      }
+        _airwayPolylinesNotifier.value = newPolylines;
+        _airwayLabelsNotifier.value = newLabels;
+      });
     });
   }
 
-  Future<void> _loadAirportFrequencies() async {
-    try {
-      final jsonStr = await rootBundle.loadString(
-        'assets/data/airport_frequencies.json',
-      );
-      final List<dynamic> jsonList = json.decode(jsonStr);
-
-      final list = jsonList.map((e) => AirportFrequency.fromJson(e)).toList();
-
-      // Group by ICAO
-      final Map<String, List<AirportFrequency>> grouped = {};
-
-      for (final f in list) {
-        grouped.putIfAbsent(f.airportIdent, () => []).add(f);
-      }
-
-      if (!mounted) return;
-
-      setState(() {
-        _frequencies = list;
-        _freqByIcao = grouped;
-      });
-
-      print(
-        "🟢 Loaded ${_frequencies.length} frequencies for ${_freqByIcao.length} airports",
-      );
-    } catch (e) {
-      print("❌ Failed to load airport frequencies: $e");
+  Color _airwayColor(AirwaySegment a) {
+    switch ((a.airwayType ?? '').toUpperCase()) {
+      case 'V':
+        return Colors.cyanAccent.withOpacity(0.65);
+      case 'J':
+        return Colors.deepPurpleAccent.withOpacity(0.70);
+      default:
+        return Colors.white70.withOpacity(0.55);
     }
   }
 
@@ -6032,7 +7038,8 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       {'delay': 1200, 'fn': _loadVors},
       {'delay': 1600, 'fn': _loadNdbs},
       {'delay': 2000, 'fn': _loadWaypoints},
-      {'delay': 2400, 'fn': _loadAirportFrequencies},
+      {'delay': 2400, 'fn': _loadAirways},
+      {'delay': 2800, 'fn': _loadAirportFrequencies},
     ];
 
     for (final step in steps) {
@@ -6046,8 +7053,16 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     }
   }
 
-  String? _detectRunway(LatLng pos) {
-    if (simData == null || !simData!.onRunway) return null;
+  String? _detectRunway(
+    LatLng pos, {
+    double? headingOverride,
+    bool requireOnRunway = false,
+    double airportRadiusMeters = 5000,
+    double runwayDistanceMeters = 1200,
+    double headingTolerance = 35,
+  }) {
+    if (simData == null) return null;
+    if (requireOnRunway && !simData!.onRunway) return null;
 
     final currentIcao = _detectCurrentAirportIcao(pos);
     if (currentIcao == null) return null;
@@ -6055,43 +7070,112 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     final airportPos = _airportCoords[currentIcao];
     if (airportPos == null) return null;
 
-    const airportRadiusMeters = 3000.0;
-    const headingTolerance = 20.0;
-
-    final distance = Distance();
-    final aircraftHeading = simData!.heading;
+    final distance = const Distance();
+    final aircraftHeading = headingOverride ?? simData!.heading;
 
     String? bestIdent;
-    double bestHeadingDiff = double.infinity;
+    double bestScore = double.infinity;
 
     for (final rwy in _runways) {
       final mid = _runwayMidpoint(rwy);
 
-      // Only consider runways near this airport
-      if (distance(mid, airportPos) > airportRadiusMeters) continue;
+      final airportDist = distance.as(LengthUnit.Meter, mid, airportPos);
+      if (airportDist > airportRadiusMeters) continue;
+
+      final runwayDist = distance.as(LengthUnit.Meter, pos, mid);
+      if (runwayDist > runwayDistanceMeters) continue;
 
       final d1 = _headingDiff(aircraftHeading, rwy.end1Heading);
       final d2 = _headingDiff(aircraftHeading, rwy.end2Heading);
 
-      if (d1 < bestHeadingDiff && d1 <= headingTolerance) {
-        bestHeadingDiff = d1;
-        bestIdent = rwy.end1Ident;
-      }
+      final headingDiff = min(d1, d2);
+      final ident = d1 <= d2 ? rwy.end1Ident : rwy.end2Ident;
 
-      if (d2 < bestHeadingDiff && d2 <= headingTolerance) {
-        bestHeadingDiff = d2;
-        bestIdent = rwy.end2Ident;
+      final headingPenalty =
+          headingDiff <= headingTolerance
+              ? headingDiff * 15.0
+              : 1000.0 + headingDiff * 25.0;
+
+      final score = runwayDist + headingPenalty;
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestIdent = ident;
       }
     }
 
     if (bestIdent != null) {
       print(
-        "🛬 Runway detected: $currentIcao RWY $bestIdent "
-        "(Δhdg=${bestHeadingDiff.toStringAsFixed(1)}°)",
+        "🛫🛬 Runway detected: $currentIcao RWY $bestIdent "
+        "(score=${bestScore.toStringAsFixed(1)})",
       );
     }
 
     return bestIdent;
+  }
+
+  String? _detectRunwayStrict(LatLng pos) {
+    return _detectRunway(
+      pos,
+      requireOnRunway: true,
+      runwayDistanceMeters: 900,
+      headingTolerance: 20,
+    );
+  }
+
+  String? _detectRunwayRelaxed(LatLng pos) {
+    return _detectRunway(
+      pos,
+      requireOnRunway: false,
+      runwayDistanceMeters: 1200,
+      headingTolerance: 45,
+    );
+  }
+
+  String? _resolveArrivalRunway() {
+    if (_landingSnapshot?.runway != null &&
+        _landingSnapshot!.runway!.trim().isNotEmpty) {
+      return _landingSnapshot!.runway;
+    }
+
+    if (_landingSnapshot?.position != null) {
+      final retry = _detectRunway(
+        _landingSnapshot!.position,
+        requireOnRunway: false,
+        runwayDistanceMeters: 900,
+        headingTolerance: 35,
+      );
+      if (retry != null && retry.trim().isNotEmpty) {
+        return retry;
+      }
+    }
+
+    if (simData != null) {
+      final endPos = LatLng(simData!.latitude, simData!.longitude);
+      final retry = _detectRunway(
+        endPos,
+        requireOnRunway: false,
+        runwayDistanceMeters: 1200,
+        headingTolerance: 45,
+      );
+      if (retry != null && retry.trim().isNotEmpty) {
+        return retry;
+      }
+    }
+
+    if (_trail.isNotEmpty) {
+      final retry = _detectRunway(
+        _trail.last,
+        requireOnRunway: false,
+        runwayDistanceMeters: 1200,
+        headingTolerance: 45,
+      );
+      if (retry != null && retry.trim().isNotEmpty) {
+        return retry;
+      }
+    }
+
+    return null;
   }
 
   LatLng _runwayMidpoint(Runway r) {
@@ -6121,43 +7205,6 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     return bestDist <= maxDistMeters ? bestIcao : null;
   }
 
-  Widget _buildToggleChip(
-    String label,
-    bool active,
-    VoidCallback onTap,
-    bool isMobile,
-  ) {
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        padding: EdgeInsets.symmetric(
-          horizontal: isMobile ? 8 : 12,
-          vertical: isMobile ? 4 : 6,
-        ),
-        decoration: BoxDecoration(
-          color:
-              active
-                  ? Colors.blueAccent.withOpacity(isMobile ? 0.20 : 0.25)
-                  : Colors.grey.withOpacity(isMobile ? 0.15 : 0.20),
-          borderRadius: BorderRadius.circular(isMobile ? 8 : 10),
-          border: Border.all(
-            color: active ? Colors.blueAccent : Colors.grey,
-            width: isMobile ? 1.0 : 1.3,
-          ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: isMobile ? 11 : 14,
-            fontWeight: FontWeight.w600,
-            color: active ? Colors.blueAccent : Colors.grey[300],
-          ),
-        ),
-      ),
-    );
-  }
-
   AirportCategory categorizeAirport(Airport ap) {
     final code = ap.icao.toUpperCase().trim();
     final len = code.length;
@@ -6172,32 +7219,60 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     return AirportCategory.unknown;
   }
 
+  List<LatLng> _buildDisplayedRoute() {
+    final f = _currentFlight;
+    if (f == null) return const [];
+
+    final custom = _buildCustomRoute();
+
+    if (custom.length >= 2) {
+      return custom;
+    }
+
+    if (f.originLat != null &&
+        f.originLng != null &&
+        f.destinationLat != null &&
+        f.destinationLng != null) {
+      return [
+        LatLng(f.originLat!, f.originLng!),
+        LatLng(f.destinationLat!, f.destinationLng!),
+      ];
+    }
+
+    final origin =
+        f.originIcao == 'LIVEPOS'
+            ? (f.originLat != null && f.originLng != null
+                ? LatLng(f.originLat!, f.originLng!)
+                : null)
+            : _airportCoords[f.originIcao];
+
+    final destination = _airportCoords[f.destinationIcao];
+
+    if (origin != null && destination != null) {
+      return [origin, destination];
+    }
+
+    return const [];
+  }
+
   List<LatLng> _buildCustomRoute() {
     final f = _currentFlight;
     if (f == null) return const [];
 
     final List<LatLng> points = [];
 
-    // -----------------------------
-    // ORIGIN
-    // -----------------------------
     if (f.originLat != null && f.originLng != null) {
       points.add(LatLng(f.originLat!, f.originLng!));
     }
 
-    // -----------------------------
-    // WAYPOINTS (typed, safe)
-    // -----------------------------
     final wp = f.waypoints;
     if (wp != null && wp.isNotEmpty) {
       for (final Waypoint w in wp) {
+        if (w.lat == 0.0 && w.lon == 0.0) continue;
         points.add(LatLng(w.lat, w.lon));
       }
     }
 
-    // -----------------------------
-    // DESTINATION
-    // -----------------------------
     if (f.destinationLat != null && f.destinationLng != null) {
       points.add(LatLng(f.destinationLat!, f.destinationLng!));
     }
@@ -6205,97 +7280,35 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     return points;
   }
 
-  bool _isDirectRoute() {
-    return _currentFlight?.waypoints == null ||
-        _currentFlight!.waypoints!.isEmpty;
-  }
+  Future<bool> _finalizeAndUploadFlight() async {
+    if (!_inFlight) return false;
 
-  Widget _buildFilterButton(BuildContext context) {
-    return GestureDetector(
-      onTap: () => _openFilterPanel(context),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: Colors.white24),
-        ),
-        child: const Row(
-          children: [
-            Icon(Icons.tune, size: 18, color: Colors.white),
-            SizedBox(width: 6),
-            Text("Filters", style: TextStyle(color: Colors.white)),
-          ],
-        ),
-      ),
-    );
-  }
+    final s = simData;
+    if (s == null) return false;
 
-  void _openFilterPanel(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.black87,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (_) {
-        return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
-          child: Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            alignment: WrapAlignment.center,
-            children: [
-              _buildToggleChip("Waypoints", _showWaypoints, () {
-                setState(() => _showWaypoints = !_showWaypoints);
-                _throttledUpdateWaypointMarkers(force: true);
-              }, false),
+    if (!s.onGround) return false;
+    if (s.airspeed > 8) return false;
 
-              _buildToggleChip("NDB", _showNDB, () {
-                setState(() => _showNDB = !_showNDB);
-                _throttledUpdateNdbMarkers(force: true);
-              }, false),
+    final detectedIdent = _detectRunwayStrict(LatLng(s.latitude, s.longitude));
+    final matchedRunway = _getRunwayByIdent(detectedIdent);
+    final surface = matchedRunway?.surface.trim().toUpperCase() ?? '';
+    final bool softField = surface == 'G' || surface == 'D' || surface == 'GR';
 
-              _buildToggleChip("Normal", _filterBig, () {
-                setState(() => _filterBig = !_filterBig);
-                _throttledUpdateAirportMarkers(force: true);
-              }, false),
-
-              _buildToggleChip("Heli", _filterHeli, () {
-                setState(() => _filterHeli = !_filterHeli);
-                _throttledUpdateAirportMarkers(force: true);
-              }, false),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _finalizeAndUploadFlight() async {
-    if (!_inFlight) return;
+    if (!isHelicopter && !softField && s.onRunway) return false;
 
     final prefs = await SharedPreferences.getInstance();
     _endTime = DateTime.now();
 
     if (!_flightQualified) {
       debugPrint("🛑 Flight ended but NEVER QUALIFIED — discarding");
-
       await _cleanupFlight(prefs);
-      return;
+      return false;
     }
 
-    // ============================================================
-    // 🛑 BASIC VALIDATION (ONLY THIS STAYS)
-    // ============================================================
     if (_startTime == null) {
       await _cleanupFlight(prefs);
-      return;
+      return false;
     }
-
-    // ============================================================
-    // 📊 RAW FLIGHT STATS (NO REJECTION)
-    // ============================================================
 
     DistanceTracker.stop();
     final distanceNm = DistanceTracker.getNm();
@@ -6306,56 +7319,32 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       'duration=$flightDuration | maxAlt=$_maxAltitude',
     );
 
-    // ============================================================
-    // 🧭 DERIVE FLIGHT TYPE
-    // ============================================================
     final jobId = prefs.getString('flight_job_id');
     final flightType = jobId != null ? 'job' : 'free';
 
-    // ============================================================
-    // 📍 FINAL POSITION
-    // ============================================================
     final LatLng? endLatLng = _trail.isNotEmpty ? _trail.last : currentLatLng;
 
-    // ============================================================
-    // 🛬 APPLY LANDING SNAPSHOT (IF AVAILABLE)
-    // ============================================================
-    _runwayUsedArrival = _landingSnapshot?.runway;
+    _runwayUsedArrival = _resolveArrivalRunway();
 
-    // ============================================================
-    // 🅿️ END PARKING DETECTION (SHUTDOWN-BASED)
-    // ============================================================
-    _parkingEnd = null;
+    String? finalParkingEnd = _parkingEnd;
 
-    if (simData != null &&
+    if ((finalParkingEnd == null || finalParkingEnd.isEmpty) &&
+        simData != null &&
         _landingSnapshot != null &&
         _canDetectParking(simData!)) {
       final endPos = LatLng(simData!.latitude, simData!.longitude);
 
-      _parkingEnd = detectParkingSpot(
+      finalParkingEnd = detectParkingSpot(
         endPos,
         icao: _landingSnapshot!.icao ?? '',
         requireFullyParked: true,
-        maxDistanceMeters: 600, // relaxed for END
+        maxDistanceMeters: 600,
       );
     }
 
     print('[SkyCase] ✈️ Arrival Runway: ${_runwayUsedArrival ?? 'NONE'}');
-    print('[SkyCase] 🅿️ Parking Spot: ${_parkingEnd ?? 'NONE'}');
+    print('[SkyCase] 🅿️ Parking Spot: ${finalParkingEnd ?? 'NONE'}');
 
-    // ============================================================
-    // 🔒 FINALIZE FLIGHT STATE (HARD STOP)
-    // ============================================================
-    _inFlight = false;
-    _flightSessionActive = false;
-    await prefs.setBool('in_flight', false);
-
-    _pulseController.stop();
-    DistanceTracker.stop();
-
-    // ============================================================
-    // 🧮 CALCULATIONS
-    // ============================================================
     final userId = prefs.getString('user_id') ?? '';
 
     final avgAirspeed =
@@ -6367,7 +7356,7 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
 
     final endLoc = _toAirportLocation(
       endLatLng,
-    )?.copyWith(runway: _runwayUsedArrival, parking: _parkingEnd);
+    )?.copyWith(runway: _runwayUsedArrival, parking: finalParkingEnd);
 
     final finalDistanceNm =
         distanceNm < 1.0
@@ -6375,15 +7364,12 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
             : distanceNm;
 
     final turbCounts = {
-      'light': _turbulenceEvents.where((e) => e.severity == 'light').length,
       'moderate':
           _turbulenceEvents.where((e) => e.severity == 'moderate').length,
       'severe': _turbulenceEvents.where((e) => e.severity == 'severe').length,
     };
+    final landing2d = _buildLanding2dPayload();
 
-    // ============================================================
-    // 📝 BUILD LOG (NO FILTERING)
-    // ============================================================
     final log = FlightLog(
       userId: userId,
       aircraft: simData?.title ?? 'Unknown',
@@ -6397,8 +7383,16 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
       maxAltitude: _maxAltitude.round(),
       cruiseTime: _cruiseDuration.inMinutes,
       turbulence: List.from(_turbulenceEvents),
-      events: {'turbulenceCount': turbCounts},
+      events: {
+        'turbulenceCount': turbCounts,
+        'butterScore': _butterScore,
+        'takeoffScore': _takeoffScore,
+        'hardLanding': _hardLanding,
+        'touchdownVerticalSpeed': _lastTouchdownVs,
+        'takeoffPitch': _lastTakeoffPitch,
+      },
       trail: _backendTrail.map((e) => FlightTrailPoint.fromJson(e)).toList(),
+      landing2d: landing2d,
       type: flightType,
       jobId: jobId,
     );
@@ -6408,33 +7402,36 @@ class _MapViewState extends State<MapView> with TickerProviderStateMixin {
     print('[SkyCase] 📤 Uploading log:');
     print(jsonEncode(log.toJson()));
 
-    // ============================================================
-// 🚀 UPLOAD
-// ============================================================
-if (endLoc?.icao.isNotEmpty == true) {
-  await prefs.setString('last_destination_icao', endLoc!.icao);
-}
+    if (endLoc?.icao.isNotEmpty == true) {
+      await prefs.setString('last_destination_icao', endLoc!.icao);
+    }
 
-// 1️⃣ Upload flight log FIRST
-final newFlightId = await FlightLogService.uploadFlightLog(log);
+    final newFlightId = await FlightLogService.uploadFlightLog(log);
 
-// 2️⃣ Only if upload succeeded → add hours
-if (newFlightId != null) {
-  final aircraftUuid = prefs.getString("current_aircraft_uuid");
+    if (newFlightId == null) {
+      print("❌ Flight log upload failed — preserving flight state");
+      showHudMessage("❌ Flight log upload failed");
+      return false;
+    }
 
-  if (aircraftUuid != null && flightDuration > 0) {
-    await AircraftService.addHours(
-      aircraftUuid: aircraftUuid,
-      minutes: flightDuration,
-    );
+    _inFlight = false;
+    _flightSessionActive = false;
+    await prefs.setBool('in_flight', false);
 
-    print("⏱️ Added $flightDuration min to aircraft $aircraftUuid");
-  }
-}
+    _pulseController.stop();
+    DistanceTracker.stop();
 
-    // ============================================================
-    // 🎯 COMPLETE JOB (IF ANY)
-    // ============================================================
+    final aircraftUuid = prefs.getString("current_aircraft_uuid");
+
+    if (aircraftUuid != null && flightDuration > 0) {
+      await AircraftService.addHours(
+        aircraftUuid: aircraftUuid,
+        minutes: flightDuration,
+      );
+
+      print("⏱️ Added $flightDuration min to aircraft $aircraftUuid");
+    }
+
     if (jobId != null) {
       await DispatchService.completeJob(jobId, userId);
 
@@ -6446,58 +7443,83 @@ if (newFlightId != null) {
       showHudMessage("🎉 Dispatch Job Completed!");
     }
 
-    // ============================================================
-    // 🧾 UI + STATS
-    // ============================================================
-    if (newFlightId != null && mounted) {
+    if (mounted) {
       await _showFlightSummaryDialog(log, startLoc, endLoc);
+      await context.read<UserProvider>().refreshProfile();
     }
 
-    final token = prefs.getString('auth_token');
-    if (token != null) {
-      await UserService(
-        baseUrl: 'http://38.242.241.46:3000',
-      ).updateStats(token, log.duration);
-    }
-
-    // ============================================================
-    // 🧹 CLEANUP
-    // ============================================================
     await _cleanupFlight(prefs);
+    return true;
   }
 
-  GroundPhase _computePhase(SimLinkData d) {
-    // 1️⃣ Airborne always wins
-    if (!d.onGround) return GroundPhase.airborne;
+  GroundPhase? _computePhase(SimLinkData d) {
+    final double speed = d.airspeed;
 
-    // 2️⃣ Runway always roll (critical)
-    if (d.onRunway) return GroundPhase.roll;
+    final bool nearlyStill = speed < 2.0;
+    final bool slowMove = speed >= 2.0 && speed < 15.0;
+    final bool fastGroundMove = speed >= 15.0;
 
-    // 3️⃣ PARKED = parking brake ON
-    if (d.parkingBrake) return GroundPhase.parked;
-
-    // 4️⃣ Taxi = brakes released + movement
-    if (d.airspeed > 2.0) return GroundPhase.taxi;
-
-    // 5️⃣ Fallback
-    return GroundPhase.parked;
-  }
-
-  String _phaseLabel(GroundPhase p) {
-    switch (p) {
-      case GroundPhase.parked:
-        return "PARKED";
-      case GroundPhase.taxi:
-        return "TAXI";
-      case GroundPhase.roll:
-        return "ROLL";
-      case GroundPhase.airborne:
-        return "AIRBORNE";
+    // -----------------------------
+    // AIRBORNE
+    // -----------------------------
+    if (!d.onGround) {
+      return GroundPhase.airborne;
     }
+
+    // -----------------------------
+    // TAKEOFF
+    // Only when actually rolling on runway
+    // -----------------------------
+    if (d.onRunway && fastGroundMove) {
+      return GroundPhase.takeoff;
+    }
+
+    // -----------------------------
+    // PUSHBACK
+    // Real pushback only:
+    // moving slowly, engines off, brake released
+    // -----------------------------
+    if (slowMove && !d.combustion && !d.parkingBrake) {
+      return GroundPhase.pushback;
+    }
+
+    // -----------------------------
+    // TAXI
+    // powered movement on ground
+    // -----------------------------
+    if ((slowMove || fastGroundMove) && d.combustion && !d.parkingBrake) {
+      return GroundPhase.taxi;
+    }
+
+    // -----------------------------
+    // STOPPED
+    // holding short / paused / waiting
+    // not final parked
+    // -----------------------------
+    if (nearlyStill && d.combustion && !d.parkingBrake && d.onGround) {
+      return GroundPhase.stopped;
+    }
+
+    // -----------------------------
+    // PARKED is NOT returned here.
+    // Final parked should only come from
+    // confirmed shutdown / end-flight logic.
+    // -----------------------------
+    return null;
   }
 
   bool _canDetectParking(SimLinkData d) {
-    return d.onGround && d.airspeed < 2.0 && d.parkingBrake && !d.combustion;
+    if (!d.onGround) return false;
+    if (d.onRunway) return false;
+    if (!d.parkingBrake) return false;
+    if (d.airspeed >= 1.0) return false;
+    if (_lastLandedEventTime == null) return false;
+
+    // must have actually landed recently / this session
+    final sinceLanding = DateTime.now().difference(_lastLandedEventTime!);
+    if (sinceLanding.inSeconds < 15) return false;
+
+    return true;
   }
 
   String? detectParkingSpot(
@@ -6733,5 +7755,2180 @@ if (newFlightId != null) {
         title.contains("chinook") ||
         title.contains("aw139") ||
         title.contains("aw169");
+  }
+
+  bool _showGroundOpsManually = false;
+
+  bool get _isAvatarGroundOps => simData?.isAvatar ?? false;
+  bool get _shouldShowGroundOps => _isAvatarGroundOps || _showGroundOpsManually;
+  bool get _groundOpsMinimalView =>
+      _showGroundOpsManually && !_isAvatarGroundOps;
+
+  double getBusVolts() {
+    final v = simData?.mainBusVolts;
+
+    if (v == null || v.isNaN || v <= 1) {
+      return 28.0; // fallback for unsupported aircraft
+    }
+
+    return v;
+  }
+
+  String? _phaseHudMessage(GroundPhase phase) {
+    switch (phase) {
+      case GroundPhase.pushback:
+        return "↩️ Pushback";
+      case GroundPhase.taxi:
+        return "🚕 Taxi";
+      case GroundPhase.stopped:
+        return "⏸ Stopped";
+      case GroundPhase.takeoff:
+        return "🛫 Takeoff";
+      case GroundPhase.airborne:
+        return "✈️ Airborne";
+      case GroundPhase.landed:
+        return "🛬 Landed";
+      case GroundPhase.parked:
+        return "🅿️ Parked";
+    }
+  }
+
+  Future<void> _updateMeaningfulPhase(
+    SimLinkData data,
+    GroundPhase? rawPhase,
+    DateTime now,
+  ) async {
+    const holdMs = 2200;
+
+    if (rawPhase == null) {
+      _pendingPhase = null;
+      _pendingPhaseSince = null;
+      return;
+    }
+
+    if (rawPhase != GroundPhase.airborne && rawPhase != GroundPhase.landed) {
+      _pendingPhase = null;
+      _pendingPhaseSince = null;
+      return;
+    }
+
+    // keep the rest only if you still want the existing debounce logic
+  }
+
+  void _showPoiInfo(Poi poi) {
+    final user = context.read<UserProvider>().user;
+    final visited = user?.stats.visitedPois ?? const <String>[];
+    final isVisited = visited.contains(poi.id);
+    final visits = user?.stats.poiVisitCounts[poi.id] ?? 0;
+    final loiterMinutes = user?.stats.poiTotalLoiterMinutes[poi.id] ?? 0.0;
+
+    showGeneralDialog(
+      context: context,
+      barrierLabel: "POI Info",
+      barrierDismissible: true,
+      barrierColor: Colors.black54,
+      transitionDuration: const Duration(milliseconds: 260),
+      pageBuilder: (context, animation, secondaryAnimation) {
+        final screenWidth = MediaQuery.of(context).size.width;
+        final isMobile = screenWidth < 700;
+        final double panelWidth = isMobile ? screenWidth * 0.94 : 430;
+
+        final Color typeColor = poiColorForType(poi.type);
+
+        return SafeArea(
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                width: panelWidth,
+                height: double.infinity,
+                margin: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.white12),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black54,
+                      blurRadius: 18,
+                      offset: Offset(-4, 0),
+                    ),
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            CircleAvatar(
+                              radius: 20,
+                              backgroundColor: typeColor.withOpacity(0.18),
+                              child: Icon(
+                                poiIconForType(poi.type),
+                                color: typeColor,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    poi.name,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    [
+                                      if (poi.country != null) poi.country!,
+                                      if (poi.era != null) poi.era!,
+                                    ].join(' • '),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            InkWell(
+                              onTap: () => Navigator.pop(context),
+                              borderRadius: BorderRadius.circular(8),
+                              child: const Padding(
+                                padding: EdgeInsets.all(4),
+                                child: Icon(
+                                  Icons.close,
+                                  color: Colors.white70,
+                                  size: 20,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color:
+                                isVisited
+                                    ? Colors.green.withOpacity(0.15)
+                                    : Colors.orange.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color:
+                                  isVisited
+                                      ? Colors.greenAccent
+                                      : Colors.orangeAccent,
+                            ),
+                          ),
+                          child: Text(
+                            isVisited ? 'Visited' : 'Not visited yet',
+                            style: TextStyle(
+                              color:
+                                  isVisited
+                                      ? Colors.greenAccent
+                                      : Colors.orangeAccent,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 16),
+
+                        if (poi.shortDescription.isNotEmpty) ...[
+                          Text(
+                            poi.shortDescription,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+
+                        Text(
+                          poi.description,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                            height: 1.45,
+                          ),
+                        ),
+
+                        const SizedBox(height: 18),
+                        Divider(color: Colors.white24),
+                        const SizedBox(height: 12),
+
+                        _infoRow('Type', poi.type),
+                        _infoRow(
+                          'Coordinates',
+                          '${poi.lat.toStringAsFixed(4)}, ${poi.lng.toStringAsFixed(4)}',
+                        ),
+                        _infoRow('Visits', '$visits'),
+                        _infoRow(
+                          'Loiter Time',
+                          '${loiterMinutes.toStringAsFixed(1)} min',
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _toggleSideMenu() {
+    if (!mounted) return;
+    setState(() => _showSideMenu = !_showSideMenu);
+  }
+
+  Widget _menuTile({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    required VoidCallback onTap,
+    Color iconColor = Colors.white,
+    bool closeMenuOnTap = true,
+  }) {
+    return ListTile(
+      leading: Icon(icon, color: iconColor),
+      title: Text(
+        title,
+        style: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      subtitle:
+          subtitle == null
+              ? null
+              : Text(subtitle, style: const TextStyle(color: Colors.white60)),
+      onTap: () {
+        onTap();
+
+        if (closeMenuOnTap && mounted) {
+          setState(() => _showSideMenu = false);
+        }
+      },
+    );
+  }
+
+  Widget _buildMapSideMenu(BuildContext context) {
+    final hasData = simData != null;
+    final canUseGeneralButtons = battOn || isDataOffline;
+
+    return AnimatedPositioned(
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeInOut,
+      top: 0,
+      bottom: 0,
+      right: _showSideMenu ? 0 : -320,
+      child: Material(
+        color: Colors.transparent,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {}, // absorb taps so background tap-close does not fire
+          child: Container(
+            width: 300,
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.94),
+              border: Border.all(color: Colors.white12),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black54,
+                  blurRadius: 18,
+                  offset: Offset(-4, 0),
+                ),
+              ],
+            ),
+            child: SafeArea(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 10, 10),
+                    child: Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Map Menu',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: _toggleSideMenu,
+                          icon: const Icon(Icons.close, color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(color: Colors.white12, height: 1),
+                  Expanded(
+                    child: ListView(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      children: [
+                        if (canUseGeneralButtons) ...[
+                          const Padding(
+                            padding: EdgeInsets.fromLTRB(16, 12, 16, 6),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.layers_outlined,
+                                  color: Colors.white70,
+                                  size: 20,
+                                ),
+                                SizedBox(width: 10),
+                                Text(
+                                  'Map Style',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                            child: Row(
+                              children: List.generate(tileLayers.length, (
+                                index,
+                              ) {
+                                final isSelected = _mapStyleIndex == index;
+                                final option = tileLayers[index];
+
+                                Color activeColor;
+                                switch (option.name.toLowerCase()) {
+                                  case 'skycase dark':
+                                    activeColor = Colors.cyanAccent;
+                                    break;
+                                  case 'skycase light':
+                                    activeColor = Colors.blueAccent;
+                                    break;
+                                  default:
+                                    activeColor = Colors.cyanAccent;
+                                }
+
+                                return Expanded(
+                                  child: Padding(
+                                    padding: EdgeInsets.only(
+                                      right:
+                                          index < tileLayers.length - 1 ? 6 : 0,
+                                    ),
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(10),
+                                      onTap: () async {
+                                        if (_mapStyleIndex == index) return;
+
+                                        setState(() {
+                                          _mapStyleIndex = index;
+                                        });
+                                        _refreshLiveMapVisuals();
+
+                                        final prefs =
+                                            await SharedPreferences.getInstance();
+                                        await prefs.setInt(_mapStyleKey, index);
+                                      },
+                                      child: AnimatedContainer(
+                                        duration: const Duration(
+                                          milliseconds: 180,
+                                        ),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 6,
+                                          vertical: 10,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color:
+                                              isSelected
+                                                  ? activeColor.withOpacity(
+                                                    0.14,
+                                                  )
+                                                  : Colors.white.withOpacity(
+                                                    0.03,
+                                                  ),
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          border: Border.all(
+                                            color:
+                                                isSelected
+                                                    ? activeColor
+                                                    : Colors.white10,
+                                            width: 1,
+                                          ),
+                                        ),
+                                        child: Center(
+                                          child: FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            child: Text(
+                                              option.name,
+                                              maxLines: 1,
+                                              softWrap: false,
+                                              style: TextStyle(
+                                                color:
+                                                    isSelected
+                                                        ? activeColor
+                                                        : Colors.white70,
+                                                fontSize: 12,
+                                                fontWeight:
+                                                    isSelected
+                                                        ? FontWeight.w700
+                                                        : FontWeight.w500,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }),
+                            ),
+                          ),
+                          const Divider(color: Colors.white12, height: 1),
+                        ],
+
+                        if (canUseGeneralButtons)
+                          _menuTile(
+                            icon: Icons.home_outlined,
+                            title: 'Return Home',
+                            onTap: () async {
+                              await _saveTrail(_trail);
+                              if (!mounted) return;
+                              Navigator.pop(context);
+                            },
+                          ),
+
+                        if (canUseGeneralButtons)
+                          _menuTile(
+                            icon: Icons.search,
+                            title: 'ICAO Search',
+                            onTap: () {
+                              _openIcaoSearchDialog();
+                            },
+                          ),
+
+                        if (_isConnected &&
+                            hasData &&
+                            (battOn || isDataOffline))
+                          _menuTile(
+                            icon: Icons.cloud_outlined,
+                            title: _showMetar ? 'Hide METAR' : 'Show METAR',
+                            closeMenuOnTap: false,
+                            onTap: () {
+                              setState(() => _showMetar = !_showMetar);
+                            },
+                          ),
+
+                        const Padding(
+                          padding: EdgeInsets.fromLTRB(16, 18, 16, 8),
+                          child: Text(
+                            'Filters',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        const Divider(color: Colors.white12, height: 1),
+
+                        _menuTile(
+                          icon: Icons.flight,
+                          iconColor:
+                              _filterBig ? Colors.cyanAccent : Colors.white70,
+                          title: _filterBig ? 'Hide Airports' : 'Show Airports',
+                          subtitle: 'Show normal airports',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            setState(() => _filterBig = !_filterBig);
+                            _throttledUpdateAirportMarkers(force: true);
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.airplane_ticket,
+                          iconColor:
+                              _filterHeli
+                                  ? Colors.orangeAccent
+                                  : Colors.white70,
+                          title:
+                              _filterHeli ? 'Hide Heliports' : 'Show Heliports',
+                          subtitle: 'Show heliports',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            setState(() => _filterHeli = !_filterHeli);
+                            _throttledUpdateAirportMarkers(force: true);
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.linear_scale,
+                          iconColor:
+                              _showRunways
+                                  ? Colors.yellowAccent
+                                  : Colors.white70,
+                          title: _showRunways ? 'Hide Runways' : 'Show Runways',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            setState(() => _showRunways = !_showRunways);
+                            _throttledUpdateRunwayPolylines();
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.route,
+                          iconColor:
+                              _showGround
+                                  ? Colors.orangeAccent
+                                  : Colors.white70,
+                          title:
+                              _showGround ? 'Hide Taxiways' : 'Show Taxiways',
+                          subtitle: 'Show taxiway lines on map',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            final next = !_showGround;
+
+                            setState(() {
+                              _showGround = next;
+
+                              if (!next) {
+                                _groundSegments = [];
+                                _groundPolylines = [];
+                                _groundLabels = [];
+                                _groundLabelMarkersNotifier.value = [];
+                              }
+                            });
+
+                            if (next) {
+                              _updateGroundOverlayFromMapCenter();
+                            }
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.local_parking,
+                          iconColor:
+                              _showParking
+                                  ? Colors.greenAccent
+                                  : Colors.white70,
+                          title: _showParking ? 'Hide Parking' : 'Show Parking',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            final next = !_showParking;
+
+                            setState(() => _showParking = next);
+
+                            if (!next) {
+                              // 🔥 turn OFF → clear immediately
+                              _parkingMarkersNotifier.value = [];
+                            } else {
+                              // 🔥 turn ON → force rebuild of parking layer
+                              _throttledUpdateParkingMarkers(force: true);
+                            }
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.radar,
+                          iconColor:
+                              _showVOR ? Colors.purpleAccent : Colors.white70,
+                          title: _showVOR ? 'Hide VOR' : 'Show VOR',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            final next = !_showVOR;
+
+                            setState(() => _showVOR = next);
+
+                            if (!next) {
+                              _vorMarkersNotifier.value = [];
+                            } else {
+                              _throttledUpdateVorMarkers(force: true);
+                            }
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.wifi_tethering,
+                          iconColor:
+                              _showNDB
+                                  ? Colors.deepOrangeAccent
+                                  : Colors.white70,
+                          title: _showNDB ? 'Hide NDB' : 'Show NDB',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            final next = !_showNDB;
+
+                            setState(() => _showNDB = next);
+
+                            if (!next) {
+                              _ndbMarkersNotifier.value = [];
+                            } else {
+                              _throttledUpdateNdbMarkers(force: true);
+                            }
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.alt_route,
+                          iconColor:
+                              _showWaypoints
+                                  ? Colors.lightBlueAccent
+                                  : Colors.white70,
+                          title:
+                              _showWaypoints
+                                  ? 'Hide Waypoints'
+                                  : 'Show Waypoints',
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            final next = !_showWaypoints;
+
+                            setState(() => _showWaypoints = next);
+
+                            if (!next) {
+                              _waypointMarkersNotifier.value = [];
+                            } else {
+                              _throttledUpdateWaypointMarkers(force: true);
+                            }
+                          },
+                        ),
+
+                        _menuTile(
+                          icon: Icons.alt_route,
+                          title: _showAirways ? 'Hide Airways' : 'Show Airways',
+                          subtitle: 'Victor / jet route segments',
+                          iconColor:
+                              _showAirways ? Colors.cyanAccent : Colors.white,
+                          closeMenuOnTap: false,
+                          onTap: () {
+                            final next = !_showAirways;
+
+                            setState(() {
+                              _showAirways = next;
+                            });
+
+                            if (!next) {
+                              _airwayPolylinesNotifier.value = [];
+                              _airwayLabelsNotifier.value = [];
+                            }
+                            if (next) {
+                              _throttledUpdateAirways(force: true);
+                            }
+                          },
+                        ),
+
+                        if (canUseGeneralButtons)
+                          _menuTile(
+                            icon: _showAllFlights ? Icons.route : Icons.history,
+                            iconColor:
+                                _showAllFlights
+                                    ? Colors.indigoAccent
+                                    : Colors.white70,
+                            title:
+                                _showAllFlights
+                                    ? 'Hide Flight History'
+                                    : 'Show Flight History',
+                            closeMenuOnTap: false,
+                            onTap: () async {
+                              if (_showAllFlights) {
+                                setState(() => _showAllFlights = false);
+                                return;
+                              }
+
+                              if (_flightLogs.isEmpty) {
+                                await _loadAllFlightLogs();
+                              }
+
+                              if (!mounted) return;
+                              setState(() => _showAllFlights = true);
+                            },
+                          ),
+
+                        if (canUseGeneralButtons)
+                          _menuTile(
+                            icon: _showPoi ? Icons.public : Icons.public_off,
+                            iconColor:
+                                _showPoi
+                                    ? Colors.lightGreenAccent
+                                    : Colors.white70,
+                            title: _showPoi ? 'Hide POI' : 'Show POI',
+                            closeMenuOnTap: false,
+                            onTap: () {
+                              setState(() => _showPoi = !_showPoi);
+                            },
+                          ),
+
+                        FutureBuilder<bool>(
+                          future: NavigraphPrefs.getHasPremium(),
+                          builder: (context, snapshot) {
+                            final hasPremium = snapshot.data ?? false;
+
+                            if (!hasPremium) return const SizedBox.shrink();
+                            if (Platform.isWindows) {
+                              return const SizedBox.shrink();
+                            }
+
+                            if (!battOn || !isDataOffline) {
+                              return const SizedBox.shrink();
+                            }
+
+                            return _menuTile(
+                              icon: Icons.map_outlined,
+                              title: 'Open Navigraph',
+                              closeMenuOnTap: false,
+                              iconColor: Colors.blueGrey,
+                              onTap: () {
+                                _openNavigraphSheet(context);
+                              },
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _flightPlanPanel(BuildContext context) {
+    if (_currentFlight == null) return const SizedBox.shrink();
+
+    final bool mobile = MediaQuery.of(context).size.width < 600;
+
+    return Container(
+      width: mobile ? 300 : 420,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.62),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withOpacity(0.10)),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black54,
+            blurRadius: 10,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.assignment_outlined,
+            color: Colors.orangeAccent,
+            size: 16,
+          ),
+          const SizedBox(width: 8),
+
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _inFlight
+                      ? '${_currentFlight!.originIcao} → ${_currentFlight!.destinationIcao}'
+                      : 'Flight Plan',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _inFlight
+                            ? '${_remainingNm.toStringAsFixed(1)} NM remaining'
+                            : 'Tap for details',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.82),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                    if (_inFlight && battOn && !batteryOnly) ...[
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: DefaultTextStyle(
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.centerRight,
+                            child: _etaHud(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(width: 10),
+
+          _smallFlightIconButton(
+            icon: Icons.info_outline,
+            tooltip: 'Flight Info',
+            onTap: () => _showFlightDialog(context),
+          ),
+          const SizedBox(width: 6),
+          _smallFlightIconButton(
+            icon: Icons.close,
+            tooltip: 'Cancel Flight',
+            color: Colors.redAccent,
+            onTap: () => _cancelFlight(context, fromDialog: false),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _smallFlightIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+    Color color = Colors.white70,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.white.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.all(7),
+            child: Icon(icon, size: 16, color: color),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _busOatPanel() {
+    return Container(
+      width: MediaQuery.of(context).size.width < 600 ? 300 : 420,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.62),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withOpacity(0.10)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Opacity(
+                opacity: (battOn && avionicsOn) ? 1.0 : 0.0,
+                child: Text(
+                  "BUS ${getBusVolts().toStringAsFixed(1)}V",
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                "OAT ${simData!.weather.temperature.toStringAsFixed(0)}°C",
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _comRadioOverlay(SimLinkData d) {
+    final bool avionics = d.avionicsOn;
+    final bool tx = d.transmitting && avionics;
+
+    return Opacity(
+      opacity: avionics ? 1.0 : 0.35,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.65),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "COM1",
+              style: TextStyle(
+                fontSize: 9,
+                color: Colors.white70,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _formatComFrequency(d.com1Active),
+                  style: const TextStyle(
+                    color: Color.fromARGB(255, 24, 255, 236),
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  _formatComFrequency(d.com1Standby),
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (tx) ...[const SizedBox(width: 6), _txBlink()],
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatComFrequency(double raw) {
+    if (raw <= 0) return "---.---";
+
+    double mhz;
+
+    if (raw > 1e9) {
+      mhz = raw / 1e7;
+    } else if (raw > 1e8) {
+      mhz = raw / 1e6;
+    } else {
+      mhz = raw;
+    }
+
+    return mhz.toStringAsFixed(3);
+  }
+
+  double _distanceNmToPoi(Poi poi) {
+    final pos = currentLatLng;
+    if (pos == null) return double.infinity;
+
+    return _calculateDistanceNm(pos, LatLng(poi.lat, poi.lng));
+  }
+
+  double _bearingToPoi(Poi poi) {
+    final pos = currentLatLng;
+    if (pos == null) return 0;
+
+    final lat1 = pos.latitude * pi / 180.0;
+    final lon1 = pos.longitude * pi / 180.0;
+    final lat2 = poi.lat * pi / 180.0;
+    final lon2 = poi.lng * pi / 180.0;
+
+    final dLon = lon2 - lon1;
+
+    final y = sin(dLon) * cos(lat2);
+    final x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+
+    final brng = atan2(y, x) * 180.0 / pi;
+    return (brng + 360.0) % 360.0;
+  }
+
+  String _turnInstructionToPoi(Poi poi) {
+    final heading = simData?.heading ?? 0.0;
+    final bearing = _bearingToPoi(poi);
+
+    double diff = (bearing - heading + 540) % 360 - 180;
+
+    if (diff.abs() < 5) {
+      return 'On course';
+    }
+
+    final dir = diff > 0 ? 'Turn right' : 'Turn left';
+    return '$dir ${diff.abs().round()}°';
+  }
+
+  void _updateNearbyPoiAlert() {
+    if (!_showPoi) {
+      if (_nearbyPoiAlert != null) {
+        setState(() => _nearbyPoiAlert = null);
+      }
+      return;
+    }
+
+    if (simData == null || simData!.onGround || currentLatLng == null) {
+      if (_nearbyPoiAlert != null) {
+        setState(() => _nearbyPoiAlert = null);
+      }
+      return;
+    }
+
+    if (_showSideMenu || _selectedMapObject != null) {
+      return;
+    }
+
+    final visiblePois = visiblePoiForZoom(_currentZoom);
+    if (visiblePois.isEmpty) return;
+
+    Poi? bestPoi;
+    double bestDist = double.infinity;
+
+    for (final poi in visiblePois) {
+      final dist = _distanceNmToPoi(poi);
+      if (dist > _poiAlertRangeNm) continue;
+
+      final dismissedAt = _dismissedPoiAlerts[poi.name];
+      if (dismissedAt != null &&
+          DateTime.now().difference(dismissedAt) < _poiAlertCooldown) {
+        continue;
+      }
+
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPoi = poi;
+      }
+    }
+
+    if (bestPoi == null) {
+      if (_nearbyPoiAlert != null) {
+        setState(() => _nearbyPoiAlert = null);
+      }
+      return;
+    }
+
+    if (_nearbyPoiAlert?.name != bestPoi.name) {
+      setState(() {
+        _nearbyPoiAlert = bestPoi;
+        _lastPoiAlertTime = DateTime.now();
+      });
+    }
+  }
+
+  void _dismissNearbyPoiAlert() {
+    final poi = _nearbyPoiAlert;
+    if (poi == null) return;
+
+    setState(() {
+      _dismissedPoiAlerts[poi.name] = DateTime.now();
+      _nearbyPoiAlert = null;
+    });
+  }
+
+  Widget _buildNearbyPoiAlertCard() {
+    final poi = _nearbyPoiAlert;
+    if (poi == null) return const SizedBox.shrink();
+
+    final distanceNm = _distanceNmToPoi(poi);
+    final bearing = _bearingToPoi(poi);
+    final turnText = _turnInstructionToPoi(poi);
+
+    return AnimatedSlide(
+      duration: const Duration(milliseconds: 280),
+      curve: Curves.easeOutCubic,
+      offset: Offset.zero,
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 220),
+        opacity: 1,
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            width: 280,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.86),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: Colors.white12),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black54,
+                  blurRadius: 14,
+                  offset: Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        color: poiColorForType(poi.type).withOpacity(0.12),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: poiColorForType(poi.type).withOpacity(0.45),
+                        ),
+                      ),
+                      child: Icon(
+                        poiIconForType(poi.type),
+                        size: 16,
+                        color: poiColorForType(poi.type),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        poi.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(20),
+                      onTap: _dismissNearbyPoiAlert,
+                      child: const Padding(
+                        padding: EdgeInsets.all(4),
+                        child: Icon(
+                          Icons.close,
+                          size: 18,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                _poiInfoRow(
+                  icon: Icons.straighten,
+                  label: '${distanceNm.toStringAsFixed(1)} NM away',
+                ),
+                const SizedBox(height: 6),
+                _poiInfoRow(
+                  icon: Icons.explore_outlined,
+                  label: 'Bearing ${bearing.round()}°',
+                ),
+                const SizedBox(height: 6),
+                _poiInfoRow(
+                  icon: Icons.turn_right,
+                  label: turnText,
+                  valueColor: Colors.cyanAccent,
+                  isBold: true,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _updatePoiProximityTimer() {
+    final poi = _nearbyPoiAlert;
+    final pos = currentLatLng;
+
+    if (poi == null || pos == null || simData == null || simData!.onGround) {
+      _activePoiTarget = null;
+      _poiInsideSince = null;
+      return;
+    }
+
+    final distanceNm = _distanceNmToPoi(poi);
+    final insideZone = distanceNm <= _poiReachRadiusNm;
+
+    if (!insideZone) {
+      if (_activePoiTarget?.name == poi.name) {
+        _activePoiTarget = null;
+        _poiInsideSince = null;
+      }
+      return;
+    }
+
+    if (_confirmedPoiNames.contains(poi.name)) {
+      return;
+    }
+
+    if (_activePoiTarget?.name != poi.name) {
+      _activePoiTarget = poi;
+      _poiInsideSince = DateTime.now();
+      return;
+    }
+
+    if (_poiInsideSince == null) {
+      _poiInsideSince = DateTime.now();
+      return;
+    }
+
+    final heldFor = DateTime.now().difference(_poiInsideSince!);
+
+    if (heldFor >= _requiredPoiHoldTime) {
+      _confirmedPoiNames.add(poi.name);
+      _activePoiTarget = null;
+      _poiInsideSince = null;
+
+      debugPrint('📍 POI confirmed internally: ${poi.name}');
+    }
+  }
+
+  Widget _poiInfoRow({
+    required IconData icon,
+    required String label,
+    Color valueColor = Colors.white70,
+    bool isBold = false,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 15, color: Colors.white54),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            label,
+            style: TextStyle(
+              color: valueColor,
+              fontSize: 13,
+              fontWeight: isBold ? FontWeight.w700 : FontWeight.w500,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  List<Polyline> _buildGroundPolylines(List<TaxiwaySegment> segments) {
+    final zoom = mapController.camera.zoom;
+
+    return segments.map((s) {
+      final isParking = s.type == 'PT' || s.type == 'P';
+      final isConnector = s.type == 'C';
+
+      double width;
+      Color color;
+
+      if (isParking) {
+        width = zoom >= 15 ? 2.0 : 1.2;
+        color = Colors.blueGrey.withOpacity(0.55);
+      } else if (isConnector) {
+        width = zoom >= 15 ? 2.8 : 1.8;
+        color = Colors.amber.withOpacity(0.75);
+      } else {
+        width = zoom >= 15 ? 3.5 : 2.2;
+        color = Colors.orangeAccent.withOpacity(0.9);
+      }
+
+      return Polyline(
+        points: [s.start, s.end],
+        strokeWidth: width,
+        color: color,
+        borderStrokeWidth: zoom >= 15 ? 0.7 : 0.3,
+        borderColor: Colors.black.withOpacity(0.25),
+      );
+    }).toList();
+  }
+
+  List<Marker> _buildGroundLabelMarkers(List<TaxiwayLabel> labels) {
+    final zoom = mapController.camera.zoom;
+
+    if (!_showGroundLabels) return [];
+    if (zoom < 13.0) return [];
+
+    final filtered =
+        labels
+            .where((l) => l.name.trim().isNotEmpty)
+            .where((l) => l.segmentCount >= 2)
+            .toList();
+
+    return filtered.map((l) {
+      return Marker(
+        point: l.position,
+        width: 56,
+        height: 22,
+        child: IgnorePointer(
+          child: Center(
+            child: Container(
+              alignment: Alignment.center,
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+              decoration: BoxDecoration(
+                color: const Color(0xCC1A1A1A),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: Colors.orangeAccent.withOpacity(0.75),
+                  width: 0.8,
+                ),
+              ),
+              child: Text(
+                l.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.orangeAccent,
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.2,
+                  height: 1.0,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }).toList();
+  }
+
+  Future<void> _updateGroundOverlayFromMapCenter() async {
+    if (!_showGround) return;
+    if (_loadingGround) return;
+    if (!_mapReady) return;
+
+    final zoom = mapController.camera.zoom;
+
+    // Stricter zoom gate
+    if (zoom < 13.8) {
+      if (!mounted) return;
+
+      setState(() {
+        _groundSegments = [];
+        _groundPolylines = [];
+        _groundLabels = [];
+      });
+
+      _groundLabelMarkersNotifier.value = [];
+
+      return;
+    }
+
+    final now = DateTime.now();
+    final center = mapController.camera.center;
+
+    const distance = Distance();
+
+    final movedEnough =
+        _lastGroundQueryPoint == null ||
+        distance.as(LengthUnit.Meter, _lastGroundQueryPoint!, center) > 350;
+
+    final waitedEnough =
+        _lastGroundQueryTime == null ||
+        now.difference(_lastGroundQueryTime!).inMilliseconds >= 2500;
+
+    if (!movedEnough && !waitedEnough) {
+      return;
+    }
+
+    _loadingGround = true;
+    _lastGroundQueryPoint = center;
+    _lastGroundQueryTime = now;
+
+    try {
+      final overlay = await GroundService.fetchAroundCenter(
+        centerLat: center.latitude,
+        centerLon: center.longitude,
+        tileRadius: 1, // 3x3 max
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _groundSegments = overlay.lines;
+        _groundPolylines = _buildGroundPolylines(overlay.lines);
+        _groundLabels = overlay.labels;
+      });
+
+      _groundLabelMarkersNotifier.value =
+          _showGroundLabels ? _buildGroundLabelMarkers(overlay.labels) : [];
+    } catch (e) {
+      debugPrint('❌ Ground overlay fetch failed: $e');
+    } finally {
+      _loadingGround = false;
+    }
+  }
+
+  Widget _buildSingleVorMarker(Vor v, double zoom) {
+    final showLabel = zoom >= 11.5;
+    final size = zoom >= 13 ? 24.0 : 20.0;
+
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _selectedMapObject = v;
+          _selectedMapObjectType = 'vor';
+        });
+      },
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: size,
+            height: size,
+            child: CustomPaint(
+              painter: VorMarkerPainter(
+                color: Colors.blueAccent,
+                strokeColor: Colors.white,
+              ),
+            ),
+          ),
+          if (showLabel) ...[
+            const SizedBox(height: 3),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+              decoration: BoxDecoration(
+                color: const Color(0xCC111111),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: Colors.blueAccent.withOpacity(0.5),
+                  width: 0.7,
+                ),
+              ),
+              child: Text(
+                v.ident,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  height: 1.0,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildVorClusterMarker(List<Vor> group, double zoom) {
+    final bool isSingle = group.length == 1;
+    final String countLabel = group.length > 9 ? '9+' : '${group.length}';
+
+    return IgnorePointer(
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: isSingle ? 6 : 9,
+              height: isSingle ? 6 : 9,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Colors.purpleAccent,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.purpleAccent.withOpacity(0.95),
+                    blurRadius: isSingle ? 8 : 10,
+                    spreadRadius: isSingle ? 0.8 : 1.2,
+                  ),
+                ],
+              ),
+            ),
+            if (!isSingle)
+              Text(
+                countLabel,
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  fontFamily: 'RobotoMono',
+                  color: Colors.white,
+                  shadows: [Shadow(color: Colors.black, blurRadius: 4)],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSelectedObjectCard() {
+    final accent = _selectedObjectAccent();
+
+    String primary = '';
+    List<Widget> details = [];
+
+    if (_selectedMapObjectType == 'vor') {
+      final v = _selectedMapObject as Vor;
+      primary = v.ident;
+      details = [
+        _infoLine('Frequency', '${_formatVorFrequency(v.frequency)} MHz'),
+      ];
+    } else if (_selectedMapObjectType == 'ndb') {
+      final n = _selectedMapObject as Ndb;
+      primary = n.ident;
+      details = [
+        _infoLine('Frequency', '${_formatVorFrequency(n.frequency)} MHz'),
+      ];
+    } else if (_selectedMapObjectType == 'parking') {
+      final p = _selectedMapObject as ParkingSpot;
+      primary = '${p.name} ${p.number}';
+      details = [
+        _infoLine('ICAO', p.icao),
+        _infoLine('Type', p.type),
+        _infoLine('Jetway', p.hasJetway ? 'YES' : 'NO'),
+      ];
+    } else if (_selectedMapObjectType == 'waypoint') {
+      final w = _selectedMapObject as Waypoint;
+      primary = w.ident;
+      details = [
+        _infoLine('Type', w.type),
+        _infoLine(
+          'Coords',
+          '${w.lat.toStringAsFixed(4)}, ${w.lon.toStringAsFixed(4)}',
+        ),
+      ];
+    }
+
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        width: 280,
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              const Color(0xFF0B0F14).withOpacity(0.96),
+              const Color(0xFF121922).withOpacity(0.94),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: accent.withOpacity(0.35), width: 1),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.35),
+              blurRadius: 18,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: accent.withOpacity(0.14),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: accent.withOpacity(0.35)),
+                  ),
+                  child: Text(
+                    _selectedObjectTitle(),
+                    style: TextStyle(
+                      color: accent,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.6,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                InkWell(
+                  borderRadius: BorderRadius.circular(20),
+                  onTap: () {
+                    setState(() {
+                      _selectedMapObject = null;
+                      _selectedMapObjectType = null;
+                    });
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.04),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.close,
+                      color: Colors.white70,
+                      size: 18,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              primary,
+              style: TextStyle(
+                color: accent,
+                fontSize: 22,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.2,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Container(height: 1, color: Colors.white.withOpacity(0.08)),
+            const SizedBox(height: 10),
+            ...details,
+          ],
+        ),
+      ),
+    );
+  }
+
+  Color _selectedObjectAccent() {
+    switch (_selectedMapObjectType) {
+      case 'vor':
+        return Colors.purpleAccent;
+      case 'ndb':
+        return Colors.deepOrangeAccent;
+      case 'parking':
+        return Colors.greenAccent;
+      case 'waypoint':
+        return Colors.lightBlueAccent;
+      default:
+        return Colors.white;
+    }
+  }
+
+  String _selectedObjectTitle() {
+    switch (_selectedMapObjectType) {
+      case 'vor':
+        return 'VOR';
+      case 'ndb':
+        return 'NDB';
+      case 'parking':
+        return 'PARKING';
+      case 'waypoint':
+        return 'WAYPOINT';
+      default:
+        return 'OBJECT';
+    }
+  }
+
+  Widget _infoLine(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 74,
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                height: 1.2,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDraggableSelectedObjectCard(BuildContext context) {
+    _ensureInfoCardPosition(context);
+
+    const cardWidth = 280.0;
+    const cardHeightEstimate = 170.0;
+
+    final screenSize = MediaQuery.of(context).size;
+
+    return GestureDetector(
+      onPanUpdate: (details) {
+        setState(() {
+          _infoCardLeft += details.delta.dx;
+          _infoCardTop += details.delta.dy;
+
+          // clamp inside screen
+          _infoCardLeft = _infoCardLeft.clamp(
+            8.0,
+            screenSize.width - cardWidth - 8.0,
+          );
+
+          _infoCardTop = _infoCardTop.clamp(
+            70.0,
+            screenSize.height - cardHeightEstimate - 8.0,
+          );
+        });
+      },
+      child: _buildSelectedObjectCard(),
+    );
+  }
+
+  void _ensureInfoCardPosition(BuildContext context) {
+    if (_infoCardInitialized) return;
+
+    final screenWidth = MediaQuery.of(context).size.width;
+
+    // Start near the top-right
+    _infoCardLeft = screenWidth - 296; // card width + margin
+    _infoCardTop = 110;
+    _infoCardInitialized = true;
+  }
+
+  String _formatVorFrequency(dynamic raw) {
+    if (raw == null) return '--';
+
+    // Handle int (108600 → 108.600)
+    if (raw is int) {
+      return (raw / 1000).toStringAsFixed(3);
+    }
+
+    // Handle double already (108.6 → 108.600)
+    if (raw is double) {
+      return raw.toStringAsFixed(3);
+    }
+
+    // Handle string just in case
+    final parsed = double.tryParse(raw.toString());
+    if (parsed != null) {
+      return parsed.toStringAsFixed(3);
+    }
+
+    return raw.toString();
+  }
+
+  Future<void> _resetLiveFlightVisuals() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    _trail.clear();
+    _backendTrail.clear();
+    _turbulenceEvents.clear();
+    _startPoint = null;
+    _lastBackendTrailUpdate = null;
+    _lastTurbTime = null;
+    _pendingFlightEnd = false;
+    _pendingEndTime = null;
+    _currentFlight = null;
+
+    await prefs.remove('flight_trail');
+    await prefs.remove('turbulence_events');
+    await prefs.remove('start_lat');
+    await prefs.remove('start_lng');
+    await prefs.remove('last_flight');
+
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _resetPlannedRouteOnly() async {
+    final prefs = await SharedPreferences.getInstance();
+    _currentFlight = null;
+    _pendingFlightEnd = false;
+    _pendingEndTime = null;
+    await prefs.remove('last_flight');
+
+    if (mounted) setState(() {});
+  }
+
+  Widget _buildCinematicHud() {
+    if (_cinematicHudMessage == null) return const SizedBox.shrink();
+
+    return IgnorePointer(
+      ignoring: true,
+      child: AnimatedBuilder(
+        animation: _hudFxController,
+        builder: (context, _) {
+          final t = _hudFxController.value;
+
+          final planeEnter = Curves.easeOutCubic.transform(
+            Interval(0.00, 0.28).transform(t.clamp(0.0, 0.28) / 0.28),
+          );
+
+          final orbitT = ((t - 0.18) / 0.20).clamp(0.0, 1.0);
+          final orbit = Curves.easeInOut.transform(orbitT);
+
+          final circleT = ((t - 0.32) / 0.16).clamp(0.0, 1.0);
+
+          // keep overshoot for visual growth
+          final circleGrow = Curves.easeOutBack.transform(circleT);
+
+          // safe opacity value
+          final circleOpacity = Curves.easeOut
+              .transform(circleT)
+              .clamp(0.0, 1.0);
+
+          final unwrapT = ((t - 0.45) / 0.28).clamp(0.0, 1.0);
+          final unwrap = Curves.easeOutCubic.transform(unwrapT);
+
+          final textT = ((t - 0.68) / 0.18).clamp(0.0, 1.0);
+          final textOpacity = Curves.easeOut.transform(textT).clamp(0.0, 1.0);
+
+          final baseLeft = 18.0;
+          final baseTop = 92.0;
+
+          final planeStartX = -56.0;
+          final planeEndX = baseLeft + 22.0;
+          final planeX = lerpDouble(planeStartX, planeEndX, planeEnter)!;
+
+          final orbitRadius = 14.0 * (1.0 - unwrap);
+          final orbitAngle = orbit * pi * 1.65;
+          final orbitDx = sin(orbitAngle) * orbitRadius;
+          final orbitDy = -cos(orbitAngle) * orbitRadius * 0.55;
+
+          final containerWidth = lerpDouble(48, 320, unwrap)!;
+          final containerOpacity =
+              (((t - 0.34) / 0.18).clamp(0.0, 1.0)).toDouble();
+
+          final planeScale = 1.0 - (circleGrow * 0.18);
+          final planeOpacity = (1.0 - (unwrap * 0.18)).clamp(0.0, 1.0);
+
+          return Stack(
+            children: [
+              Positioned(
+                top: baseTop,
+                left: baseLeft,
+                child: Opacity(
+                  opacity: containerOpacity,
+                  child: Container(
+                    width: containerWidth,
+                    height: 64,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.86),
+                      borderRadius: BorderRadius.circular(22),
+                      border: Border.all(
+                        color: _cinematicHudAccent.withOpacity(0.72),
+                        width: 1.25,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: _cinematicHudAccent.withOpacity(0.16),
+                          blurRadius: 18,
+                          spreadRadius: 2,
+                        ),
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.45),
+                          blurRadius: 16,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
+                    ),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final panelWideEnough = constraints.maxWidth >= 170;
+                        final showText = constraints.maxWidth >= 190;
+
+                        return Row(
+                          children: [
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Opacity(
+                                opacity: circleOpacity,
+                                child: Transform.scale(
+                                  scale: circleGrow,
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: _cinematicHudAccent.withOpacity(
+                                        0.14,
+                                      ),
+                                      border: Border.all(
+                                        color: _cinematicHudAccent.withOpacity(
+                                          0.95,
+                                        ),
+                                        width: 1.4,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+
+                            if (panelWideEnough) const SizedBox(width: 12),
+
+                            if (showText)
+                              Expanded(
+                                child: Opacity(
+                                  opacity:
+                                      textOpacity.clamp(0.0, 1.0).toDouble(),
+                                  child: Transform.translate(
+                                    offset: Offset(12 * (1 - textOpacity), 0),
+                                    child: Text(
+                                      _cinematicHudMessage ?? '',
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      softWrap: true,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w700,
+                                        letterSpacing: 0.2,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+
+                            if (panelWideEnough) const SizedBox(width: 14),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: baseTop + 8 + orbitDy,
+                left: planeX + orbitDx,
+                child: Opacity(
+                  opacity: planeOpacity.toDouble(),
+                  child: Transform.scale(
+                    scale: planeScale,
+                    child: Icon(
+                      _cinematicHudIcon ?? Icons.airplanemode_active,
+                      color: _cinematicHudAccent,
+                      size: 30,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _handleTakeoffEvent({
+    required SimLinkData data,
+    required DateTime now,
+  }) async {
+    final double pitch = data.pitch;
+    final double takeoffScore = _calculateTakeoffScore(pitch);
+    final String takeoffRating = takeoffGradeFromPitch(pitch);
+
+    _recordedTakeoffPitch = pitch;
+    _takeoffScore = takeoffScore;
+    _lastTakeoffRating = takeoffRating;
+    _lastTakeoffPitch = pitch;
+
+    _livePhase = GroundPhase.airborne;
+    _lastAnnouncedPhase = GroundPhase.airborne;
+
+    await CockpitVibration.onPhaseChange(GroundPhase.airborne);
+
+    showHudMessage(
+      "Airborne",
+      icon: Icons.flight_takeoff,
+      accent: Colors.lightBlueAccent,
+    );
+
+    await _pushJobPhase('enroute');
+  }
+
+  Future<void> _handleLandingEvent({
+    required SimLinkData data,
+    required LatLng latlng,
+    required DateTime now,
+    required bool isHelicopter,
+    required bool helicopterHasWheels,
+  }) async {
+    final bool canDetectRunway = !isHelicopter || helicopterHasWheels;
+
+    final String? detectedRunway =
+        canDetectRunway
+            ? _detectRunway(
+              latlng,
+              requireOnRunway: false,
+              runwayDistanceMeters: 900,
+              headingTolerance: 35,
+            )
+            : null;
+
+    final String? detectedIcao = _toAirportLocation(latlng)?.icao;
+
+    _updateLandingSnapshot(
+      latlng: latlng,
+      now: now,
+      detectedRunway: detectedRunway,
+      detectedIcao: detectedIcao,
+    );
+
+    _captureTouchdownReplay(now);
+
+    final double touchdownVs = data.verticalSpeed;
+    final double butterScore = _calculateButterScore(touchdownVs);
+    final bool hardLanding = touchdownVs.abs() > 500;
+
+    _recordLandingMetrics(
+      touchdownVs: touchdownVs,
+      butterScore: butterScore,
+      hardLanding: hardLanding,
+    );
+
+    _lastLandedEventTime = now;
+    _livePhase = GroundPhase.landed;
+    _lastAnnouncedPhase = GroundPhase.landed;
+
+    await CockpitVibration.onPhaseChange(GroundPhase.landed);
+
+    showHudMessage(
+      "Landed",
+      icon: Icons.flight_land,
+      accent: Colors.lightGreenAccent,
+    );
+
+    await _pushJobPhase('arrived');
+  }
+
+  void _updateLandingSnapshot({
+    required LatLng latlng,
+    required DateTime now,
+    required String? detectedRunway,
+    required String? detectedIcao,
+  }) {
+    final LandingSnapshot? currentSnapshot = _landingSnapshot;
+
+    if (currentSnapshot == null) {
+      _landingSnapshot = LandingSnapshot(
+        position: latlng,
+        runway: detectedRunway,
+        icao: detectedIcao,
+        time: now,
+      );
+      return;
+    }
+
+    final bool snapshotMissingRunway =
+        currentSnapshot.runway == null || currentSnapshot.runway!.isEmpty;
+
+    final bool newRunwayAvailable =
+        detectedRunway != null && detectedRunway.isNotEmpty;
+
+    if (snapshotMissingRunway && newRunwayAvailable) {
+      _landingSnapshot = LandingSnapshot(
+        position: currentSnapshot.position,
+        runway: detectedRunway,
+        icao: currentSnapshot.icao ?? detectedIcao,
+        time: currentSnapshot.time,
+      );
+    }
+  }
+
+  void _captureTouchdownReplay(DateTime now) {
+    _touchdownTime = now;
+    _landingReplayFinal
+      ..clear()
+      ..addAll(_landingReplayBuffer);
+    _recordLandingRollout = true;
+  }
+
+  void _recordLandingMetrics({
+    required double touchdownVs,
+    required double butterScore,
+    required bool hardLanding,
+  }) {
+    _lastTouchdownVs = touchdownVs;
+    _butterScore = butterScore;
+    _hardLanding = hardLanding;
+    _lastLandingRating = butterGradeFromVs(touchdownVs);
+  }
+
+  String butterGradeFromVs(double touchdownVs) {
+    final vs = touchdownVs.abs();
+
+    if (vs < 80) return 'Perfect';
+    if (vs < 140) return 'Smooth';
+    if (vs < 200) return 'Good';
+    if (vs < 300) return 'Firm';
+    return 'Hard';
+  }
+
+  bool _isStableStopped(SimLinkData data, LatLng currentPos) {
+    if (!data.onGround) {
+      _endCheckStartPos = null;
+      _endCheckSince = null;
+      return false;
+    }
+
+    final bool lowSpeed = data.airspeed < 5;
+
+    if (!lowSpeed) {
+      _endCheckStartPos = null;
+      _endCheckSince = null;
+      return false;
+    }
+
+    _endCheckStartPos ??= currentPos;
+    _endCheckSince ??= DateTime.now();
+
+    final movedNm = _calculateDistanceNm(_endCheckStartPos!, currentPos);
+    final stableLongEnough =
+        DateTime.now().difference(_endCheckSince!).inSeconds >= 12;
+
+    if (movedNm > 0.015) {
+      _endCheckStartPos = currentPos;
+      _endCheckSince = DateTime.now();
+      return false;
+    }
+
+    return stableLongEnough;
+  }
+
+  Runway? _getRunwayByIdent(String? ident) {
+    if (ident == null || ident.isEmpty) return null;
+
+    final needle = ident.trim().toUpperCase();
+
+    for (final r in _runways) {
+      if (r.end1Ident.trim().toUpperCase() == needle ||
+          r.end2Ident.trim().toUpperCase() == needle) {
+        return r;
+      }
+    }
+
+    return null;
   }
 }

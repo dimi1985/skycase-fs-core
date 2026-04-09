@@ -1,4 +1,5 @@
-import 'package:skycase/models/radio_state.dart';
+import 'package:skycase/models/fuel_tanks.dart';
+import 'package:skycase/models/gsx_status.dart';
 
 typedef J = Map<String, dynamic>;
 
@@ -11,6 +12,7 @@ bool b(dynamic v) {
 class SimLinkData {
   // ========= BASIC AIRCRAFT STATE =========
   final String title;
+  final String aircraftCategory;
   final double latitude;
   final double longitude;
   final double altitude;
@@ -45,9 +47,6 @@ class SimLinkData {
 
   // ========= ENGINE =========
   final double rpm;
-
-  // ========= PAYLOAD =========
-  final PayloadData payload;
 
   // ========= LIGHTS / DOORS =========
   final MissionData mission;
@@ -87,8 +86,15 @@ class SimLinkData {
   final double elevatorTrim;
   final double rudderDeflectionDeg;
 
+  final GsxStatus gsx;
+  final LiveFuelTanks? fuelTanks;
+  final String atcId;
+  final String atcFlightNumber;
+  final String atcAirline;
+
   SimLinkData({
     required this.title,
+    required this.aircraftCategory,
     required this.latitude,
     required this.longitude,
     required this.altitude,
@@ -111,7 +117,6 @@ class SimLinkData {
     required this.flapsIndex,
     required this.flapsPercent,
     required this.rpm,
-    required this.payload,
     required this.mission,
     required this.autopilot,
     required this.gear,
@@ -131,11 +136,17 @@ class SimLinkData {
     required this.slipBetaDeg,
     required this.elevatorTrim,
     required this.rudderDeflectionDeg,
+    required this.gsx,
+    required this.fuelTanks,
+    required this.atcId,
+    required this.atcFlightNumber,
+    required this.atcAirline,
   });
 
   factory SimLinkData.fromJson(J j) {
     return SimLinkData(
       title: j['title'] ?? '—',
+      aircraftCategory: j['aircraftCategory'] ?? '',
       latitude: (j['latitude'] ?? 0).toDouble(),
       longitude: (j['longitude'] ?? 0).toDouble(),
       altitude: (j['altitude'] ?? 0).toDouble(),
@@ -144,28 +155,24 @@ class SimLinkData {
       verticalSpeed: (j['verticalSpeed'] ?? 0).toDouble(),
       pitch: (j['pitch'] ?? 0).toDouble(),
       onGround: b(j['onGround']),
-
       fuelGallons: (j['fuelGallons'] ?? 0).toDouble(),
       fuelCapacityGallons: (j['fuelCapacityGallons'] ?? 0).toDouble(),
-
+      fuelTanks:
+          j['fuelTanks'] is Map<String, dynamic>
+              ? LiveFuelTanks.fromJson(j['fuelTanks'])
+              : null,
       mainBusVolts: (j['mainBusVolts'] ?? 0).toDouble(),
       avionicsOn: b(j['avionicsOn']),
-
       com1Active: (j['com1Active'] ?? 0).toDouble(),
       com1Standby: (j['standby'] ?? 0).toDouble(),
       transmitting: b(j['transmitting']),
       receive: b(j['receive']),
-
       structural: (j['structural'] ?? 0).toDouble(),
-
       gearHandleDown: b(j['handleDown']),
       gearPosition: (j['position'] ?? 0).toDouble(),
       flapsIndex: (j['index'] ?? 0).toInt(),
       flapsPercent: (j['percent'] ?? 0).toDouble(),
-
       rpm: (j['rpm'] ?? 0).toDouble(),
-
-      payload: PayloadData.fromJson(j['payload'] ?? {}),
       mission: MissionData.fromJson(j['mission'] ?? {}),
       autopilot: AutopilotData.fromJson(j['autopilot'] ?? {}),
       gear: GearConfig.fromJson(j['gear'] ?? {}),
@@ -185,13 +192,13 @@ class SimLinkData {
       slipBetaDeg: (j['slipBetaDeg'] ?? 0).toDouble(),
       elevatorTrim: (j['elevatorTrim'] ?? 0).toDouble(),
       rudderDeflectionDeg: (j['deflectionDeg'] ?? 0).toDouble(),
+      gsx: GsxStatus.fromJson(j['gsx'] ?? {}),
+      atcId: j['atcId'] ?? '',
+      atcFlightNumber: j['atcFlightNumber'] ?? '',
+      atcAirline: j['atcAirline'] ?? '',
     );
   }
 }
-
-//
-// ========================== WEATHER ==========================
-//
 
 class WeatherData {
   final double windDirection;
@@ -241,10 +248,6 @@ class WeatherData {
   );
 }
 
-//
-// ========================== AUTOPILOT ==========================
-//
-
 class AutopilotData {
   final bool master;
   final bool headingLock;
@@ -290,10 +293,6 @@ class AutopilotData {
   );
 }
 
-//
-// ========================== MISSION (lights + doors) ==========================
-//
-
 class MissionData {
   final bool battery;
   final bool beacon;
@@ -333,47 +332,6 @@ class MissionData {
   );
 }
 
-//
-// ========================== PAYLOAD ==========================
-//
-
-class PayloadData {
-  final double totalWeight;
-  final List<PayloadStation> stations;
-
-  PayloadData({required this.totalWeight, required this.stations});
-
-  factory PayloadData.fromJson(J j) {
-    final raw = (j['stations'] as List? ?? []);
-    return PayloadData(
-      totalWeight: (j['totalWeight'] ?? 0).toDouble(),
-      stations: raw.map((e) => PayloadStation.fromJson(e)).toList(),
-    );
-  }
-}
-
-class PayloadStation {
-  final int index;
-  final String name;
-  final double weight;
-
-  PayloadStation({
-    required this.index,
-    required this.name,
-    required this.weight,
-  });
-
-  factory PayloadStation.fromJson(J j) => PayloadStation(
-    index: j['index'] ?? 0,
-    name: j['name'] ?? "Station",
-    weight: (j['weight'] ?? 0).toDouble(),
-  );
-}
-
-//
-// ========================== GEAR TYPE ==========================
-//
-
 class GearConfig {
   final bool floats;
   final bool retractable;
@@ -397,10 +355,6 @@ class GearConfig {
     wheels: b(j['wheels']),
   );
 }
-
-//
-// ========================== WEIGHTS ==========================
-//
 
 class WeightData {
   final double emptyWeight;
@@ -428,7 +382,7 @@ class WeightData {
     totalWeight: (j['totalWeight'] ?? 0).toDouble(),
     zfw: (j['zfw'] ?? 0).toDouble(),
     fuelWeight: (j['fuelWeight'] ?? 0).toDouble(),
-    payloadWeight: (j['payload'] ?? 0).toDouble(),
+    payloadWeight: (j['payloadWeight'] ?? j['payload'] ?? 0).toDouble(),
     maxTakeoffWeight: (j['maxTakeoffWeight'] ?? 0).toDouble(),
     maxZeroFuelWeight: (j['maxZeroFuelWeight'] ?? 0).toDouble(),
     maxGrossWeight: (j['maxGrossWeight'] ?? 0).toDouble(),
